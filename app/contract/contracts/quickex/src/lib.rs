@@ -63,6 +63,8 @@ mod pause_policy;
 mod pause_policy_test;
 mod privacy;
 #[cfg(test)]
+mod privacy_history_test;
+#[cfg(test)]
 mod receipt_reference_test;
 #[cfg(test)]
 mod role_test;
@@ -199,7 +201,7 @@ impl QuickexContract {
     }
 
     /// Deprecated audit history of levels requested via `enable_privacy`,
-    /// newest first. Purely additive; not authoritative.
+    /// newest first, capped at 64 entries. Not authoritative.
     pub fn privacy_history(env: Env, account: Address) -> Vec<u32> {
         privacy::privacy_history(&env, account)
     }
