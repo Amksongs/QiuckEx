@@ -1,6 +1,12 @@
 import React from "react";
 import { Button } from "react-native";
-import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react-native";
 import * as LocalAuthentication from "expo-local-authentication";
 
 import { SecurityProvider, useSecurity } from "../hooks/use-security";
@@ -90,22 +96,22 @@ describe("PIN authentication reason tracking", () => {
       );
     };
 
-    const { getByTestId } = render(
+    render(
       <SecurityProvider>
         <TestConsumer />
       </SecurityProvider>,
     );
 
     await waitFor(() =>
-      expect(getByTestId("authenticate").props.disabled).toBe(false),
+      expect(screen.getByTestId("authenticate").props.disabled).toBe(false),
     );
 
-    fireEvent.press(getByTestId("authenticate"));
-    await waitFor(() => expect(getByTestId("pin-input")).toBeTruthy());
+    fireEvent.press(screen.getByTestId("authenticate"));
+    await waitFor(() => expect(screen.getByTestId("pin-input")).toBeTruthy());
 
-    fireEvent.changeText(getByTestId("pin-input"), "1234");
+    fireEvent.changeText(screen.getByTestId("pin-input"), "1234");
     await act(async () => {
-      fireEvent.press(getByTestId("submit-pin"));
+      fireEvent.press(screen.getByTestId("submit-pin"));
       await authentication;
     });
 
