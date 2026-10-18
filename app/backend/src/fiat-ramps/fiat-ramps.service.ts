@@ -10,11 +10,15 @@ import {
 import { AnchorClientService } from './anchor-client.service';
 import { AppConfigService } from '../config/app-config.service';
 
-interface AnchorDirectoryEntry {
+export interface AnchorDirectoryEntry {
   domain: string;
   name?: string;
   type?: string;
   supportedCountries?: string[];
+  webhookSecret?: string;
+  sharedSecret?: string;
+  secret?: string;
+  apiKey?: string;
 }
 
 /** Errors that should return a 400 (client-facing, expected). */
@@ -36,6 +40,57 @@ export class FiatRampsService {
     private readonly anchorClient: AnchorClientService,
     private readonly appConfig: AppConfigService,
   ) {}
+
+  /**
+   * Retrieve the configured webhook secret for a specific anchor domain.
+   */
+  getAnchorSecret(anchorDomain: string): string | undefined {
+    if (!anchorDomain) return undefined;
+    const domainLower = anchorDomain.trim().toLowerCase();
+
+    // 1. Check ANCHOR_DIRECTORY_JSON entry
+    const configuredAnchors = this.parseAnchorDirectory();
+    const entry = configuredAnchors.find((a) => a.domain.trim().toLowerCase() === domainLower);
+    if (entry) {
+      const secret = entry.webhookSecret ?? entry.sharedSecret ?? entry.secret ?? entry.apiKey;
+      if (secret) return secret;
+    }
+
+    // 2. Check ANCHOR_WEBHOOK_SECRETS map from config
+    const secretsMap = this.appConfig.anchorWebhookSecrets;
+    for (const [key, val] of Object.entries(secretsMap)) {
+      if (key.trim().toLowerCase() === domainLower && val) {
+        return val;
+      }
+    }
+
+    // 3. Fallback default secret
+    return this.appConfig.anchorWebhookSecret;
+  }
+
+  /**
+   * Retrieve all configured anchor domains and their secrets.
+   */
+  getAllConfiguredAnchorSecrets(): Map<string, string> {
+    const map = new Map<string, string>();
+
+    // 1. Configured directory entries
+    for (const anchor of this.parseAnchorDirectory()) {
+      const secret = anchor.webhookSecret ?? anchor.sharedSecret ?? anchor.secret ?? anchor.apiKey;
+      if (secret) {
+        map.set(anchor.domain.trim().toLowerCase(), secret);
+      }
+    }
+
+    // 2. Configured secrets map
+    for (const [domain, secret] of Object.entries(this.appConfig.anchorWebhookSecrets)) {
+      if (secret) {
+        map.set(domain.trim().toLowerCase(), secret);
+      }
+    }
+
+    return map;
+  }
 
   async getAvailableAnchors(assetCode: string, country: string) {
     this.logger.log(`Fetching available anchors for ${assetCode} in ${country}`);
@@ -84,7 +139,7 @@ export class FiatRampsService {
     };
   }
 
-  private parseAnchorDirectory(): AnchorDirectoryEntry[] {
+  public parseAnchorDirectory(): AnchorDirectoryEntry[] {
     const raw = this.appConfig.anchorDirectoryJson;
     if (!raw) return [];
 

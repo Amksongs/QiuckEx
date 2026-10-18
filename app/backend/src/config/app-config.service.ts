@@ -536,6 +536,30 @@ export class AppConfigService {
   }
 
   /**
+   * JSON mapping of anchor domains to their webhook secrets.
+   */
+  get anchorWebhookSecrets(): Record<string, string> {
+    const raw = this.configService.get("ANCHOR_WEBHOOK_SECRETS", { infer: true });
+    if (!raw) return {};
+    try {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+        return parsed as Record<string, string>;
+      }
+    } catch {
+      // Ignore invalid JSON format
+    }
+    return {};
+  }
+
+  /**
+   * Default fallback shared webhook secret for anchors without a specific secret.
+   */
+  get anchorWebhookSecret(): string | undefined {
+    return this.configService.get("ANCHOR_WEBHOOK_SECRET", { infer: true });
+  }
+
+  /**
    * Get Stellar Network Passphrase
    */
   get stellarNetworkPassphrase(): string {

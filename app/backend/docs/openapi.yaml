@@ -1735,18 +1735,48 @@ paths:
       tags: [fiat-ramps]
       operationId: handleKycCallback
       summary: Handle KYC redirects
+      parameters:
+        - in: header
+          name: X-Anchor-Signature
+          schema:
+            type: string
+          required: false
+          description: HMAC-SHA256 signature of the payload (e.g. sha256=<hex>)
+        - in: header
+          name: X-Anchor-Secret
+          schema:
+            type: string
+          required: false
+          description: Shared secret issued to the anchor
       responses:
         "200":
           description: Callback processed
+        "401":
+          description: Missing or invalid webhook signature or secret
 
   /fiat-ramps/transaction/status:
     post:
       tags: [fiat-ramps]
       operationId: updateTransactionStatus
       summary: Handle transaction status updates
+      parameters:
+        - in: header
+          name: X-Anchor-Signature
+          schema:
+            type: string
+          required: false
+          description: HMAC-SHA256 signature of the payload (e.g. sha256=<hex>)
+        - in: header
+          name: X-Anchor-Secret
+          schema:
+            type: string
+          required: false
+          description: Shared secret issued to the anchor
       responses:
         "200":
           description: Status updated
+        "401":
+          description: Missing or invalid webhook signature or secret
 
   # ---------------------------------------------------------------------------
   # Admin / Refunds

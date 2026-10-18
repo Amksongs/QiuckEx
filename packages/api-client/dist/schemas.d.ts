@@ -4136,7 +4136,12 @@ export interface operations {
     handleKycCallback: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description HMAC-SHA256 signature of the payload (e.g. sha256=<hex>) */
+                "X-Anchor-Signature"?: string;
+                /** @description Shared secret issued to the anchor */
+                "X-Anchor-Secret"?: string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -4149,12 +4154,24 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description Missing or invalid webhook signature or secret */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     updateTransactionStatus: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description HMAC-SHA256 signature of the payload (e.g. sha256=<hex>) */
+                "X-Anchor-Signature"?: string;
+                /** @description Shared secret issued to the anchor */
+                "X-Anchor-Secret"?: string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -4162,6 +4179,13 @@ export interface operations {
         responses: {
             /** @description Status updated */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid webhook signature or secret */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };
