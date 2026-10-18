@@ -114,4 +114,6 @@ pub enum QuickexError {
     NonceAlreadyUsed = 500,
     /// The signature's valid_until timestamp has passed; signature expired.
     SignatureExpired = 501,
+    /// Maximum number of registered oracle sources reached.
+    OracleSourceLimitExceeded = 606,
 }

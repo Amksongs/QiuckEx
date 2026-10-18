@@ -27,6 +27,7 @@ import { MetricsModule } from "../metrics/metrics.module";
 import { ApiKeysModule } from "../api-keys/api-keys.module";
 import { FiatRampsModule } from "../fiat-ramps/fiat-ramps.module";
 import { ExportStorageModule } from "../exports/export-storage.module";
+import { SentryModule } from "../sentry";
 import {
   WebhookDeliveryHandler,
   RecurringPaymentHandler,
@@ -61,6 +62,7 @@ import {
     MetricsModule,
     ApiKeysModule,
     ExportStorageModule,
+    SentryModule,
     forwardRef(() => NotificationsModule),
     forwardRef(() => LinksModule),
     forwardRef(() => ReconciliationModule),

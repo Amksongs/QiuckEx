@@ -71,6 +71,16 @@ export const envSchema = Joi.object({
       "JSON array of configured anchor domains and supported country codes",
     ),
 
+  ANCHOR_WEBHOOK_SECRETS: Joi.string()
+    .empty("")
+    .optional()
+    .description("JSON mapping of anchor domains to their webhook secrets"),
+
+  ANCHOR_WEBHOOK_SECRET: Joi.string()
+    .empty("")
+    .optional()
+    .description("Default webhook secret for anchors without a specific secret"),
+
   STELLAR_NETWORK_PASSPHRASE: Joi.string()
     .empty("")
     .optional()
@@ -131,6 +141,20 @@ export const envSchema = Joi.object({
     .max(10)
     .default(3)
     .description("Max retry attempts for transient Soroban RPC failures"),
+
+  HORIZON_REQUEST_TIMEOUT_MS: Joi.number()
+    .integer()
+    .min(1000)
+    .default(10000)
+    .description("Timeout in milliseconds for outbound Horizon requests made by HorizonService"),
+
+  SCAM_ALERTS_FETCH_TIMEOUT_MS: Joi.number()
+    .integer()
+    .min(100)
+    .default(3000)
+    .description(
+      "Timeout in milliseconds for scam-alerts external blocklist fetches",
+    ),
 
   STELLAR_EXPLORER_URL: Joi.string()
     .uri({ scheme: ["http", "https"] })
@@ -752,6 +776,15 @@ export const envSchema = Joi.object({
   OTEL_DEBUG: Joi.boolean()
     .default(false)
     .description("Enable verbose OpenTelemetry SDK diagnostic logging"),
+
+  // ---------------------------------------------------------------------------
+  // Stealth privacy debug endpoints (#1215; disabled by default, non-prod only)
+  // ---------------------------------------------------------------------------
+  PRIVACY_DEBUG_ENDPOINTS_ENABLED: Joi.boolean()
+    .default(false)
+    .description(
+      "Explicit opt-in flag to enable local/dev-only stealth privacy debug endpoints (/privacy/derive-shared-secret and /privacy/decrypt-recipient). Ignored and blocked in production.",
+    ),
 });
 
 /**
@@ -770,6 +803,8 @@ export interface EnvConfig {
   ROUTER_CONTRACT_ID?: string;
   ALLOWED_TOKENS?: string;
   ANCHOR_DIRECTORY_JSON?: string;
+  ANCHOR_WEBHOOK_SECRETS?: string;
+  ANCHOR_WEBHOOK_SECRET?: string;
   STELLAR_NETWORK_PASSPHRASE?: string;
   NETWORK: "testnet" | "mainnet";
   STELLAR_NETWORK?: "testnet" | "mainnet";
@@ -781,6 +816,8 @@ export interface EnvConfig {
   SOROBAN_RPC_URLS?: string;
   SOROBAN_RPC_TIMEOUT_MS: number;
   SOROBAN_RPC_MAX_RETRIES: number;
+  HORIZON_REQUEST_TIMEOUT_MS: number;
+  SCAM_ALERTS_FETCH_TIMEOUT_MS: number;
   STELLAR_EXPLORER_URL?: string;
   STELLAR_SECRET_KEY?: string;
   STELLAR_PUBLIC_KEY?: string;
@@ -880,4 +917,5 @@ export interface EnvConfig {
   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT?: string;
   OTEL_TRACE_SAMPLE_RATE: number;
   OTEL_DEBUG: boolean;
+  PRIVACY_DEBUG_ENDPOINTS_ENABLED: boolean;
 }

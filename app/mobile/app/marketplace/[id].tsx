@@ -6,32 +6,30 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { useMarketplaceDetail } from "../../hooks/useMarketplaceDetail";
+import { useWallet } from "../../hooks/useWallet";
+import { useSecurity } from "../../hooks/use-security";
 import { useTheme } from "../../src/theme/ThemeContext";
 import {
   type MarketplaceBid,
   type MarketplaceListingDetail,
   formatPublicKey,
+  fetchMarketplaceListingDetail,
+  placeBid,
 } from "../../services/marketplace";
 import type { ThemeTokens } from "../../src/theme/tokens";
 
-/**
- * Listing detail screen — reads from GET /marketplace/:listingId/detail.
- *
- * SCOPE NOTE: Bid placement is excluded from this screen. The backend endpoint
- * POST /marketplace/:listingId/bid exists, but the on-device wallet-signing
- * flow required to safely submit a bid is not yet implemented in mobile.
- * See PR notes for the dependency.
- */
 export default function MarketplaceDetailScreen() {
   const { theme } = useTheme();
   const router = useRouter();
   const { id } = useLocalSearchParams<{ id: string }>();
-  const { state, refresh } = useMarketplaceDetail(id);
+  const { wallet } = useWallet();
+  const { state, refresh } = useMarketplaceDetail(id, wallet.publicKey);
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
@@ -78,7 +76,12 @@ export default function MarketplaceDetailScreen() {
 
       {state.status === "success" && (
         <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-          <DetailContent detail={state.detail as MarketplaceListingDetail} theme={theme} />
+          <DetailContent
+            detail={state.detail}
+            listingId={id}
+            wallet={wallet}
+            theme={theme}
+          />
         </ScrollView>
       )}
     </SafeAreaView>
@@ -89,12 +92,25 @@ type Theme = ReturnType<typeof useTheme>["theme"];
 
 function DetailContent({
   detail,
+  listingId,
+  wallet,
   theme,
 }: {
   detail: MarketplaceListingDetail;
+  listingId: string;
+  wallet: ReturnType<typeof useWallet>["wallet"];
   theme: ThemeTokens;
 }) {
-  const { listing, bids, seller, state_hints } = detail;
+  const router = useRouter();
+  const { authenticateForSensitiveAction } = useSecurity();
+  const { listing, seller, state_hints } = detail;
+  const [bids, setBids] = React.useState(detail.bids);
+  const [bidAmount, setBidAmount] = React.useState("");
+  const [isSubmitting, setIsSubmitting] = React.useState(false);
+  const [bidFeedback, setBidFeedback] = React.useState<{
+    type: "success" | "error";
+    message: string;
+  } | null>(null);
 
   const statusLabel =
     listing.status === "active" ? "Active" : listing.status === "sold" ? "Sold" : "Cancelled";
@@ -170,9 +186,160 @@ function DetailContent({
               {state_hints.unavailable_reason}
             </Text>
           ) : null}
-          <Text style={[styles.bidNote, { color: theme.textMuted }]}>
-            Bid placement is not yet available in the mobile app.
-          </Text>
+          {state_hints.can_place_bid ? (
+            <>
+              {wallet.connected && wallet.publicKey ? (
+                <>
+                  <Text style={[styles.bidPrompt, { color: theme.textSecondary }]}>
+                    Enter a bid of at least {state_hints.minimum_bid_amount.toLocaleString()} USDC.
+                    You&apos;ll authenticate before your bid is submitted.
+                  </Text>
+                  <TextInput
+                    accessibilityLabel="Bid amount in USDC"
+                    accessibilityHint={`Enter at least ${state_hints.minimum_bid_amount} USDC`}
+                    keyboardType="decimal-pad"
+                    value={bidAmount}
+                    onChangeText={(value) => {
+                      setBidAmount(value);
+                      setBidFeedback(null);
+                    }}
+                    placeholder="Bid amount"
+                    placeholderTextColor={theme.textMuted}
+                    style={[
+                      styles.bidInput,
+                      {
+                        backgroundColor: theme.inputBg,
+                        borderColor: theme.inputBorder,
+                        color: theme.inputText,
+                      },
+                    ]}
+                  />
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityState={{ disabled: isSubmitting }}
+                    disabled={isSubmitting}
+                    onPress={() => {
+                      void (async () => {
+                        const amountText = bidAmount.trim();
+                        const amount = Number(amountText);
+                        const bidderPublicKey = wallet.publicKey;
+                        if (!wallet.connected || !bidderPublicKey) {
+                          setBidFeedback({
+                            type: "error",
+                            message: "Connect your wallet before placing a bid.",
+                          });
+                          return;
+                        }
+
+                        if (
+                          !amountText ||
+                          !/^\d+(?:\.\d+)?$/.test(amountText) ||
+                          !Number.isFinite(amount) ||
+                          amount < state_hints.minimum_bid_amount ||
+                          (amountText.split(".")[1]?.length ?? 0) > 7
+                        ) {
+                          setBidFeedback({
+                            type: "error",
+                            message: `Enter a valid bid of at least ${state_hints.minimum_bid_amount.toLocaleString()} USDC (up to 7 decimal places).`,
+                          });
+                          return;
+                        }
+
+                        setIsSubmitting(true);
+                        setBidFeedback(null);
+                        try {
+                          const authorized = await authenticateForSensitiveAction(
+                            "payment_authorization",
+                          );
+                          if (!authorized) {
+                            setBidFeedback({
+                              type: "error",
+                              message: "Authentication was not completed. Your bid was not submitted.",
+                            });
+                            return;
+                          }
+
+                          const bid = await placeBid(listingId, amount, bidderPublicKey);
+                          setBids((current) => [bid, ...current]);
+                          setBidAmount("");
+                          setBidFeedback({
+                            type: "success",
+                            message: "Your bid was placed successfully.",
+                          });
+                        } catch (error) {
+                          let message =
+                            error instanceof Error
+                              ? error.message
+                              : "Unable to place your bid. Please try again.";
+                          try {
+                            const latest = await fetchMarketplaceListingDetail(
+                              listingId,
+                              wallet.publicKey,
+                            );
+                            setBids(latest.bids);
+                          } catch (refreshError) {
+                            const refreshMessage =
+                              refreshError instanceof Error
+                                ? refreshError.message
+                                : "Bid history could not be refreshed.";
+                            message += ` Bid history refresh failed: ${refreshMessage}`;
+                          }
+                          setBidFeedback({ type: "error", message });
+                        } finally {
+                          setIsSubmitting(false);
+                        }
+                      })();
+                    }}
+                    style={[
+                      styles.submitButton,
+                      { backgroundColor: theme.buttonPrimaryBg },
+                      isSubmitting && styles.submitButtonDisabled,
+                    ]}
+                  >
+                    {isSubmitting ? (
+                      <ActivityIndicator color={theme.buttonPrimaryText} />
+                    ) : (
+                      <Text style={[styles.submitButtonText, { color: theme.buttonPrimaryText }]}>
+                        Place bid
+                      </Text>
+                    )}
+                  </Pressable>
+                </>
+              ) : (
+                <View style={styles.walletPrompt}>
+                  <Text style={[styles.bidPrompt, { color: theme.textSecondary }]}>
+                    Connect a wallet to place a bid.
+                  </Text>
+                  <Pressable
+                    accessibilityRole="button"
+                    onPress={() => router.push("/wallet-connect")}
+                    style={[styles.submitButton, { backgroundColor: theme.buttonPrimaryBg }]}
+                  >
+                    <Text style={[styles.submitButtonText, { color: theme.buttonPrimaryText }]}>
+                      Connect wallet
+                    </Text>
+                  </Pressable>
+                </View>
+              )}
+              {bidFeedback ? (
+                <Text
+                  accessibilityRole={bidFeedback.type === "error" ? "alert" : undefined}
+                  accessibilityLiveRegion="polite"
+                  style={[
+                    styles.bidFeedback,
+                    {
+                      color:
+                        bidFeedback.type === "success"
+                          ? theme.status.success
+                          : theme.status.error,
+                    },
+                  ]}
+                >
+                  {bidFeedback.message}
+                </Text>
+              ) : null}
+            </>
+          ) : null}
         </View>
       )}
 
@@ -351,11 +518,25 @@ const styles = StyleSheet.create({
   hint: {
     fontSize: 13,
   },
-  bidNote: {
-    fontSize: 12,
-    fontStyle: "italic",
-    marginTop: 4,
+  bidPrompt: { fontSize: 13, lineHeight: 19 },
+  walletPrompt: { gap: 10 },
+  bidInput: {
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 11,
+    fontSize: 16,
   },
+  submitButton: {
+    minHeight: 46,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 16,
+  },
+  submitButtonDisabled: { opacity: 0.65 },
+  submitButtonText: { fontSize: 15, fontWeight: "700" },
+  bidFeedback: { fontSize: 13, lineHeight: 18 },
   emptyBids: {
     fontSize: 14,
   },

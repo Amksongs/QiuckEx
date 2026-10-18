@@ -80,6 +80,109 @@ pub struct TtlPolicy {
     pub ttl: u32,
 }
 
+impl TtlPolicy {
+    /// Maximum allowed TTL in ledgers (~3 years at 5s per ledger).
+    pub const MAX_TTL_LEDGERS: u32 = 18_921_600;
+
+    /// Validate the TTL policy bounds.
+    ///
+    /// Returns `Err` if:
+    /// - `ttl` is zero (no-op TTL is invalid)
+    /// - `ttl` exceeds the maximum allowed value
+    /// - `threshold` is zero (TTL extension would never trigger)
+    /// - `threshold` >= `ttl` (extension would be triggered too late)
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.ttl == 0 {
+            return Err("TtlPolicy: ttl must be > 0");
+        }
+        if self.ttl > Self::MAX_TTL_LEDGERS {
+            return Err("TtlPolicy: ttl exceeds maximum allowed ledgers");
+        }
+        if self.threshold == 0 {
+            return Err("TtlPolicy: threshold must be > 0");
+        }
+        if self.threshold >= self.ttl {
+            return Err("TtlPolicy: threshold must be < ttl");
+        }
+        Ok(())
+    }
+}
+
+/// Global dispute quorum configuration (singleton).
+///
+/// Stored under [`DataKey::DisputeQuorumConfig`]. Defines platform-wide bounds
+/// on arbiter counts and vote thresholds to prevent misconfigured escrows from
+/// getting permanently locked.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisputeQuorumConfig {
+    /// Maximum number of arbiters allowed in a multi-sig escrow (N in M-of-N).
+    pub max_arbiters: u32,
+    /// Maximum allowed quorum threshold (M in M-of-N). Must be <= max_arbiters.
+    pub max_quorum_threshold: u32,
+}
+
+impl DisputeQuorumConfig {
+    /// Hard maximum on arbiter count across all escrows.
+    pub const HARD_MAX_ARBITERS: u32 = 100;
+
+    /// Validate that the config is internally consistent and within hard bounds.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.max_arbiters == 0 {
+            return Err("DisputeQuorumConfig: max_arbiters must be > 0");
+        }
+        if self.max_arbiters > Self::HARD_MAX_ARBITERS {
+            return Err("DisputeQuorumConfig: max_arbiters exceeds hard maximum (100)");
+        }
+        if self.max_quorum_threshold == 0 {
+            return Err("DisputeQuorumConfig: max_quorum_threshold must be > 0");
+        }
+        if self.max_quorum_threshold > self.max_arbiters {
+            return Err("DisputeQuorumConfig: max_quorum_threshold must be <= max_arbiters");
+        }
+        Ok(())
+    }
+}
+
+/// Oracle aggregation configuration (singleton).
+///
+/// Stored under [`DataKey::OracleAggregationConfig`]. Defines platform-wide bounds
+/// on oracle fee pricing to prevent runaway fees or stale-price edge cases.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OracleAggregationConfig {
+    /// Maximum allowed USD fee in microdollars (1 USD = 1_000_000 microdollars).
+    /// Prevents an oracle from setting fees above an acceptable ceiling.
+    pub max_usd_fee_micros: i128,
+    /// Maximum allowed stale threshold in seconds before oracle data is rejected.
+    /// Prevents configs with unreasonably long stale windows.
+    pub max_stale_threshold_secs: u64,
+}
+
+impl OracleAggregationConfig {
+    /// Hard maximum fee: 10,000 USD in microdollars.
+    pub const HARD_MAX_USD_FEE_MICROS: i128 = 10_000_000_000;
+    /// Hard maximum stale window: 7 days in seconds.
+    pub const HARD_MAX_STALE_SECS: u64 = 604_800;
+
+    /// Validate that the config is within hard bounds.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.max_usd_fee_micros <= 0 {
+            return Err("OracleAggregationConfig: max_usd_fee_micros must be > 0");
+        }
+        if self.max_usd_fee_micros > Self::HARD_MAX_USD_FEE_MICROS {
+            return Err("OracleAggregationConfig: max_usd_fee_micros exceeds hard maximum");
+        }
+        if self.max_stale_threshold_secs == 0 {
+            return Err("OracleAggregationConfig: max_stale_threshold_secs must be > 0");
+        }
+        if self.max_stale_threshold_secs > Self::HARD_MAX_STALE_SECS {
+            return Err("OracleAggregationConfig: max_stale_threshold_secs exceeds 7-day limit");
+        }
+        Ok(())
+    }
+}
+
 /// Get TTL policy for a given record type.
 fn get_ttl_policy(record_type: RecordType) -> TtlPolicy {
     match record_type {
@@ -252,6 +355,8 @@ pub enum DataKey {
     UserRole(Address),
     /// Per-asset fee override keyed by token address (Fee Router v2).
     PerAssetFee(Address),
+    /// Registry of all token addresses with a per-asset fee override (Fee Router v2, singleton).
+    PerAssetFeeRegistry,
     /// Current active fee collector rotation index (Fee Router v2, singleton).
     FeeCollectorIndex,
     /// Fee collector address at a given rotation index (Fee Router v2).
@@ -505,8 +610,28 @@ pub fn is_upgrade_in_progress(env: &Env) -> bool {
 ///
 /// Called after migration to validate state machine and fee bounds.
 /// Returns `Ok(())` if all invariants hold; `Err(msg)` deterministically if violated.
+///
+/// ## Checked invariants
+///
+/// | # | Invariant                                       | Gap filled by this PR |
+/// |---|-------------------------------------------------|-----------------------|
+/// | 1 | Global `fee_bps` within `[0, MAX_FEE_BPS]`     | pre-existing          |
+/// | 2 | Contract version equals `CURRENT`              | pre-existing          |
+/// | 3 | Admin address is set                           | pre-existing          |
+/// | 4 | `TtlPolicy` bounds valid for all record types  | **new (Issue #1173)**  |
+/// | 5 | `DisputeQuorumConfig` bounds (if configured)   | **new (Issue #1173)**  |
+/// | 6 | `OracleAggregationConfig` bounds (if configured) | **new (Issue #1173)** |
+/// | 7 | `OracleFeeConfig` active config bounds         | **new (Issue #1173)**  |
+/// | 8 | Per-asset fees in registry within `[0, MAX_FEE_BPS]` | **new (Issue #1173)** |
+///
+/// ## Per-asset fee decision (Issue #1173 AC3)
+///
+/// Per-asset fees are now tracked via a `PerAssetFeeRegistry` (`Vec<Address>`) stored
+/// under [`DataKey::PerAssetFeeRegistry`]. Every call to `set_per_asset_fee` must
+/// register the token in this list so this invariant can iterate and validate all
+/// configured tokens. The registry is append-only and deduplicated at write time.
 pub fn assert_post_upgrade_invariants(env: &Env) -> Result<(), &'static str> {
-    // Invariant 1: Fee bounds must be within [0, MAX_FEE_BPS] basis points.
+    // Invariant 1: Global fee bounds must be within [0, MAX_FEE_BPS] basis points.
     let fee_cfg = get_fee_config(env);
     if fee_cfg.fee_bps > crate::fee::MAX_FEE_BPS {
         return Err("fee_bps exceeds maximum (10000)");
@@ -523,13 +648,67 @@ pub fn assert_post_upgrade_invariants(env: &Env) -> Result<(), &'static str> {
         return Err("admin not initialized post-upgrade");
     }
 
-    // Invariant 4: Escrow counter must remain non-negative (always true for u64).
-    let _counter = get_escrow_counter(env);
-    // Counter is u64, so this is always valid.
+    // Invariant 4: TtlPolicy bounds must be valid for every record type.
+    // The TTL policy is computed inline (not stored), so we validate the known
+    // constants that drive it. This catches any future misconfiguration if
+    // LEDGER_THRESHOLD or SIX_MONTHS_IN_LEDGERS are edited incorrectly.
+    let record_types = [
+        RecordType::Escrow,
+        RecordType::EscrowDispute,
+        RecordType::FeeConfig,
+        RecordType::StealthEscrow,
+        RecordType::EscrowIdMap,
+    ];
+    for rt in record_types {
+        let policy = get_ttl_policy(rt);
+        policy.validate()?;
+    }
 
-    // Invariant 5: Per-asset fee bounds (if any exist).
-    // Note: We cannot iterate all per-asset fees here without a registry.
-    // This is validated per-write in set_per_asset_fee.
+    // Invariant 5: DisputeQuorumConfig bounds (if the singleton has been stored).
+    if let Some(qcfg) = get_dispute_quorum_config(env) {
+        qcfg.validate()?;
+    }
+
+    // Invariant 6: OracleAggregationConfig bounds (always has a value due to defaults).
+    {
+        let oac = get_oracle_aggregation_config(env);
+        if oac.min_sources == 0 {
+            return Err("OracleAggregationConfig: min_sources must be >= 1");
+        }
+        if oac.max_deviation_bps > 10_000 {
+            return Err("OracleAggregationConfig: max_deviation_bps must be <= 10_000 (100%)");
+        }
+    }
+
+    // Invariant 7: Active OracleFeeConfig bounds (if the oracle pricing is configured).
+    if let Some(oracle_cfg) = get_oracle_fee_config(env) {
+        if oracle_cfg.usd_fee_micros <= 0 {
+            return Err("OracleFeeConfig: usd_fee_micros must be > 0");
+        }
+        if oracle_cfg.usd_fee_micros > OracleAggregationConfig::HARD_MAX_USD_FEE_MICROS {
+            return Err("OracleFeeConfig: usd_fee_micros exceeds hard maximum");
+        }
+        if oracle_cfg.stale_threshold_secs == 0 {
+            return Err("OracleFeeConfig: stale_threshold_secs must be > 0");
+        }
+        if oracle_cfg.stale_threshold_secs > OracleAggregationConfig::HARD_MAX_STALE_SECS {
+            return Err("OracleFeeConfig: stale_threshold_secs exceeds 7-day limit");
+        }
+    }
+
+    // Invariant 8: Per-asset fee registry — iterate all configured tokens and
+    // validate fee_bps and arbiter_bps for each.
+    let registry = get_per_asset_fee_registry(env);
+    for token in registry.iter() {
+        if let Some(asset_cfg) = get_per_asset_fee(env, &token) {
+            if asset_cfg.fee_bps > crate::fee::MAX_FEE_BPS {
+                return Err("per-asset fee_bps exceeds maximum (10000)");
+            }
+            if asset_cfg.arbiter_bps > crate::fee::MAX_FEE_BPS {
+                return Err("per-asset arbiter_bps exceeds maximum (10000)");
+            }
+        }
+    }
 
     Ok(())
 }
@@ -1129,10 +1308,58 @@ pub fn get_per_asset_fee(env: &Env, token: &Address) -> Option<crate::types::Per
 }
 
 /// Set per-asset fee config for `token`.
+///
+/// Also registers `token` in the [`DataKey::PerAssetFeeRegistry`] so that
+/// [`assert_post_upgrade_invariants`] can iterate and validate all configured
+/// per-asset fees.  The registry is deduplicated: tokens already present are
+/// not added again.
 pub fn set_per_asset_fee(env: &Env, token: &Address, config: &crate::types::PerAssetFeeConfig) {
     let key = DataKey::PerAssetFee(token.clone());
     env.storage().persistent().set(&key, config);
+    // Register token in the per-asset fee registry (append-only, deduplicated).
+    let mut registry = get_per_asset_fee_registry(env);
+    if !registry.contains(token.clone()) {
+        registry.push_back(token.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::PerAssetFeeRegistry, &registry);
+    }
 }
+
+/// Get the list of all token addresses that have a per-asset fee override.
+pub fn get_per_asset_fee_registry(env: &Env) -> Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PerAssetFeeRegistry)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+// -----------------------------------------------------------------------------
+// DisputeQuorumConfig helpers (Issue #1173)
+// -----------------------------------------------------------------------------
+
+/// Get the global dispute quorum configuration (if set).
+pub fn get_dispute_quorum_config(env: &Env) -> Option<DisputeQuorumConfig> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::DisputeQuorumConfig)
+}
+
+/// Set the global dispute quorum configuration.
+///
+/// **Validation**: callers should call `config.validate()` before storing.
+#[allow(dead_code)]
+pub fn set_dispute_quorum_config(env: &Env, config: &DisputeQuorumConfig) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::DisputeQuorumConfig, config);
+}
+
+// -----------------------------------------------------------------------------
+// OracleAggregationConfig helpers (Issue #1173)
+// (get_oracle_aggregation_config / set_oracle_aggregation_config are defined
+// earlier in this file as the canonical multi-source oracle helpers)
+// -----------------------------------------------------------------------------
 
 /// Get current fee collector rotation index (default 0).
 pub fn get_fee_collector_index(env: &Env) -> u32 {

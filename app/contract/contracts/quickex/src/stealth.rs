@@ -24,6 +24,13 @@
 //!
 //! This is not an on-chain privacy guarantee. Contract invocation arguments are
 //! public, including `spend_pub`; see the derivation document before integrating.
+//!
+//! ## Reentrancy Protection
+//!
+//! Entrypoints for stealth deposits (`register_ephemeral_key`) and stealth withdrawals
+//! (`stealth_withdraw`) are guarded against reentrancy via `hook::assert_not_reentrant`
+//! enforced at the `lib.rs` entrypoint, consistent with all other deposit and withdrawal
+//! paths in the contract.
 
 use soroban_sdk::{token, Address, Bytes, BytesN, Env};
 
@@ -86,6 +93,10 @@ pub fn derive_stealth_address(
 /// - [`InvalidAmount`]            – amount ≤ 0.
 /// - [`StealthAddressMismatch`]   – on-chain re-derivation does not match `stealth_address`.
 /// - [`StealthAddressAlreadyUsed`]– a deposit already exists for this stealth address.
+///
+/// Note: Reentrancy protection ([`QuickexError::ReentrancyDetected`]) is enforced
+/// at the `lib.rs` entrypoint via [`crate::hook::assert_not_reentrant`], matching
+/// all other deposit entrypoints.
 pub fn register_ephemeral_key(
     env: &Env,
     params: StealthDepositParams,

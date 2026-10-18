@@ -1,3 +1,4 @@
+import { clearNotificationWalletSigner } from "../services/notification-wallet-auth";
 import React, {
   createContext,
   useCallback,
@@ -133,6 +134,7 @@ export const WalletProvider: React.FC<{ children: React.ReactNode }> = ({
 
           await touchSession();
         } else if (session && invalidReason.invalid) {
+          clearNotificationWalletSigner();
           await clearWalletSession();
           await clearSensitiveSessionToken();
 
@@ -303,6 +305,7 @@ export const WalletProvider: React.FC<{ children: React.ReactNode }> = ({
       }
     }
 
+    clearNotificationWalletSigner();
     await clearWalletSession();
     await clearSensitiveSessionToken();
 

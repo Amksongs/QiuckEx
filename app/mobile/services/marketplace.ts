@@ -1,12 +1,6 @@
 import { API_URL } from "../src/config/build";
 
-/**
- * API client for the backend GET /marketplace and GET /marketplace/:listingId/detail endpoints.
- *
- * NOTE: Bid placement (POST /marketplace/:listingId/bid) is NOT implemented here.
- * The backend endpoint exists but the mobile bid-placement flow (wallet signing, etc.)
- * is out of scope for this change — see PR notes.
- */
+/** API client for marketplace listing and bid endpoints. */
 const API_BASE_URL = API_URL;
 
 function getApiBaseUrl() {
@@ -137,6 +131,21 @@ export async function fetchMarketplaceListingDetail(
   return requestJson<MarketplaceListingDetail>(
     `/marketplace/${encodeURIComponent(listingId)}/detail${qs ? `?${qs}` : ""}`,
   );
+}
+
+export async function placeBid(
+  listingId: string,
+  bidAmount: number,
+  bidderPublicKey: string,
+): Promise<MarketplaceBid> {
+  const response = await requestJson<{ bid: MarketplaceBid }>(
+    `/marketplace/${encodeURIComponent(listingId)}/bid`,
+    {
+      method: "POST",
+      body: JSON.stringify({ bidderPublicKey, bidAmount }),
+    },
+  );
+  return response.bid;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

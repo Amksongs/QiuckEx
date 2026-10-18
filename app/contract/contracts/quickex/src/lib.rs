@@ -1422,6 +1422,7 @@ impl QuickexContract {
     ///
     /// # Errors
     /// * `OracleSourceAlreadyRegistered` - `source` is already registered
+    /// * `OracleSourceLimitExceeded`     - maximum number of sources (`oracle::MAX_ORACLE_SOURCES`) reached
     pub fn register_oracle_source(
         env: Env,
         caller: Address,
@@ -1696,6 +1697,7 @@ impl QuickexContract {
     /// # Errors
     /// * `InvalidAmount`            – amount ≤ 0.
     /// * `ContractPaused`           – contract is paused.
+    /// * `ReentrancyDetected`       – a hook is currently executing.
     /// * `StealthAddressMismatch`   – on-chain re-derivation does not match.
     /// * `StealthAddressAlreadyUsed`– stealth address already has a deposit.
     pub fn register_ephemeral_key(
@@ -1705,6 +1707,7 @@ impl QuickexContract {
         valid_until: u64,
     ) -> Result<BytesN<32>, QuickexError> {
         pause_policy::require_entry_allowed(&env, EntryPoint::StealthDeposit)?;
+        hook::assert_not_reentrant(&env)?;
         stealth::register_ephemeral_key(&env, params, nonce, valid_until)
     }
 
