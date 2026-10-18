@@ -17,6 +17,7 @@ export class MetricsService implements OnModuleInit {
   private sorobanRpcActiveEndpoint: client.Gauge<string>;
   private sorobanIndexerUnknownSchemaVersion: client.Counter<string>;
   private parityCheckResults: client.Gauge<string>;
+  private reconciliationDriftActive: client.Gauge<string>;
   private shadowTrafficRequests: client.Counter<string>;
   private initialized = false;
 
@@ -106,6 +107,11 @@ export class MetricsService implements OnModuleInit {
         labelNames: ["status"],
       });
 
+      this.reconciliationDriftActive = new client.Gauge({
+        name: "reconciliation_drift_active",
+        help: "Whether the latest successful payment reconciliation found drift (1=active, 0=clear)",
+      });
+
       this.shadowTrafficRequests = new client.Counter({
         name: "shadow_traffic_requests_total",
         help: "Total number of shadow traffic requests",
@@ -125,6 +131,7 @@ export class MetricsService implements OnModuleInit {
       this.register.registerMetric(this.sorobanRpcActiveEndpoint);
       this.register.registerMetric(this.sorobanIndexerUnknownSchemaVersion);
       this.register.registerMetric(this.parityCheckResults);
+      this.register.registerMetric(this.reconciliationDriftActive);
       this.register.registerMetric(this.shadowTrafficRequests);
 
       this.initialized = true;
@@ -295,6 +302,13 @@ export class MetricsService implements OnModuleInit {
       this.parityCheckResults.labels("pass").set(passed);
       this.parityCheckResults.labels("fail").set(failed);
       this.parityCheckResults.labels("warning").set(warnings);
+    } catch (error) {}
+  }
+
+  setReconciliationDriftActive(active: boolean) {
+    if (!this.initialized || !this.reconciliationDriftActive) return;
+    try {
+      this.reconciliationDriftActive.set(active ? 1 : 0);
     } catch (error) {}
   }
 

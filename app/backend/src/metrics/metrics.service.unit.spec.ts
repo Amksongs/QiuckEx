@@ -27,6 +27,7 @@ const mockRateLimitedCounter = {
 const mockGauge = {
   inc: jest.fn(),
   dec: jest.fn(),
+  set: jest.fn(),
 };
 
 let counterConstructCount = 0;
@@ -140,7 +141,12 @@ describe("MetricsService", () => {
         labelNames: ["service", "error_type"],
       });
 
-      expect(mockRegistry.registerMetric).toHaveBeenCalledTimes(9);
+      expect(client.Gauge).toHaveBeenCalledWith({
+        name: "reconciliation_drift_active",
+        help: "Whether the latest successful payment reconciliation found drift (1=active, 0=clear)",
+      });
+
+      expect(mockRegistry.registerMetric).toHaveBeenCalledTimes(15);
     });
 
     it("should handle initialization errors gracefully", () => {
@@ -250,6 +256,18 @@ describe("MetricsService", () => {
     describe("when initialized", () => {
       beforeEach(() => {
         service.onModuleInit();
+      });
+
+      describe("reconciliation drift", () => {
+        it("sets the active drift gauge to 1 and clears it to 0", () => {
+          service.onModuleInit();
+
+          service.setReconciliationDriftActive(true);
+          service.setReconciliationDriftActive(false);
+
+          expect(mockGauge.set).toHaveBeenNthCalledWith(1, 1);
+          expect(mockGauge.set).toHaveBeenNthCalledWith(2, 0);
+        });
       });
 
       describe("incrementActiveConnections", () => {
