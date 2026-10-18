@@ -54,6 +54,7 @@ import { OperationsModule } from "./operations/operations.module";
 import { RcValidationModule } from "./rc-validation/rc-validation.module";
 import { AbuseSignalsModule } from "./abuse-signals/abuse-signal.module";
 import { AbuseSignalMiddleware } from "./abuse-signals/abuse-signal.middleware";
+import { CrashReportingModule } from "./crash-reporting/crash-reporting.module";
 import { PreviewScopeModule } from "./preview-scope/preview-scope.module";
 import { PreviewScopeMiddleware } from "./preview-scope/preview-scope.middleware";
 import { BranchPreviewModule } from "./branch-preview/branch-preview.module";
@@ -122,6 +123,7 @@ OperationsModule,
     OutboxModule,
     DeploymentSyncModule,
     ManifestsModule,
+    CrashReportingModule,
     ReceiptsModule,
     ];
 
