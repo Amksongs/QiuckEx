@@ -766,6 +766,15 @@ export const envSchema = Joi.object({
   OTEL_DEBUG: Joi.boolean()
     .default(false)
     .description("Enable verbose OpenTelemetry SDK diagnostic logging"),
+
+  // ---------------------------------------------------------------------------
+  // Stealth privacy debug endpoints (#1215; disabled by default, non-prod only)
+  // ---------------------------------------------------------------------------
+  PRIVACY_DEBUG_ENDPOINTS_ENABLED: Joi.boolean()
+    .default(false)
+    .description(
+      "Explicit opt-in flag to enable local/dev-only stealth privacy debug endpoints (/privacy/derive-shared-secret and /privacy/decrypt-recipient). Ignored and blocked in production.",
+    ),
 });
 
 /**
@@ -896,4 +905,5 @@ export interface EnvConfig {
   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT?: string;
   OTEL_TRACE_SAMPLE_RATE: number;
   OTEL_DEBUG: boolean;
+  PRIVACY_DEBUG_ENDPOINTS_ENABLED: boolean;
 }
