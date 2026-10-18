@@ -71,6 +71,16 @@ export const envSchema = Joi.object({
       "JSON array of configured anchor domains and supported country codes",
     ),
 
+  ANCHOR_WEBHOOK_SECRETS: Joi.string()
+    .empty("")
+    .optional()
+    .description("JSON mapping of anchor domains to their webhook secrets"),
+
+  ANCHOR_WEBHOOK_SECRET: Joi.string()
+    .empty("")
+    .optional()
+    .description("Default webhook secret for anchors without a specific secret"),
+
   STELLAR_NETWORK_PASSPHRASE: Joi.string()
     .empty("")
     .optional()
@@ -793,6 +803,8 @@ export interface EnvConfig {
   ROUTER_CONTRACT_ID?: string;
   ALLOWED_TOKENS?: string;
   ANCHOR_DIRECTORY_JSON?: string;
+  ANCHOR_WEBHOOK_SECRETS?: string;
+  ANCHOR_WEBHOOK_SECRET?: string;
   STELLAR_NETWORK_PASSPHRASE?: string;
   NETWORK: "testnet" | "mainnet";
   STELLAR_NETWORK?: "testnet" | "mainnet";
