@@ -589,4 +589,19 @@ export class AppConfigService {
       infer: true,
     });
   }
+
+  /**
+   * Whether local/dev-only stealth privacy debug endpoints are explicitly enabled (#1215).
+   * Always returns false in production environments regardless of the env var.
+   */
+  get privacyDebugEndpointsEnabled(): boolean {
+    if (this.isProduction || this.environmentName === 'production') {
+      return false;
+    }
+    return Boolean(
+      this.configService.get('PRIVACY_DEBUG_ENDPOINTS_ENABLED', {
+        infer: true,
+      }),
+    );
+  }
 }
