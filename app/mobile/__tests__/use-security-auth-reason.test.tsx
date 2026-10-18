@@ -1,4 +1,5 @@
 import React from "react";
+import { Button } from "react-native";
 import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
 import * as LocalAuthentication from "expo-local-authentication";
 
