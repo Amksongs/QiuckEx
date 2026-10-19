@@ -1,7 +1,6 @@
 import React from "react";
-import { Button } from "react-native";
+import { Text, View } from "react-native";
 import {
-  act,
   fireEvent,
   render,
   screen,
@@ -29,7 +28,7 @@ jest.mock("../services/security", () => ({
 
 jest.mock("@/components/security/pin-auth-modal", () => {
   const React = require("react");
-  const { Button, TextInput, View } = require("react-native");
+  const { Text, TextInput, View } = require("react-native");
 
   return {
     PinAuthModal: ({ visible, pin, onPinChange, onSubmit }: any) =>
@@ -42,11 +41,11 @@ jest.mock("@/components/security/pin-auth-modal", () => {
               value: pin,
               onChangeText: onPinChange,
             }),
-            React.createElement(Button, {
-              testID: "submit-pin",
-              title: "Verify PIN",
-              onPress: onSubmit,
-            }),
+            React.createElement(
+              Text,
+              { testID: "submit-pin", onPress: onSubmit },
+              "Verify PIN",
+            ),
           )
         : null,
   };
@@ -85,35 +84,40 @@ describe("PIN authentication reason tracking", () => {
     const TestConsumer = () => {
       const security = useSecurity();
       return (
-        <Button
-          testID="authenticate"
-          title="Authenticate"
-          disabled={!security.isReady}
-          onPress={() => {
-            authentication = security.authenticateForSensitiveAction(reason);
-          }}
-        />
+        <View>
+          <Text testID="ready">{security.isReady ? "yes" : "no"}</Text>
+          <Text
+            testID="authenticate"
+            onPress={() => {
+              authentication = security.authenticateForSensitiveAction(reason);
+            }}
+          >
+            Authenticate
+          </Text>
+        </View>
       );
     };
 
-    render(
+    await render(
       <SecurityProvider>
         <TestConsumer />
       </SecurityProvider>,
     );
 
-    await waitFor(() =>
-      expect(screen.getByTestId("authenticate").props.disabled).toBe(false),
-    );
-
-    fireEvent.press(screen.getByTestId("authenticate"));
-    await waitFor(() => expect(screen.getByTestId("pin-input")).toBeTruthy());
-
-    fireEvent.changeText(screen.getByTestId("pin-input"), "1234");
-    await act(async () => {
-      fireEvent.press(screen.getByTestId("submit-pin"));
-      await authentication;
+    await waitFor(() => {
+      expect(screen.getByTestId("ready").props.children).toBe("yes");
     });
+
+    await fireEvent.press(screen.getByTestId("authenticate"));
+    await screen.findByTestId("pin-input");
+
+    await fireEvent.changeText(screen.getByTestId("pin-input"), "1234");
+    await waitFor(() => {
+      expect(screen.getByTestId("pin-input").props.value).toBe("1234");
+    });
+
+    await fireEvent.press(screen.getByTestId("submit-pin"));
+    await expect(authentication).resolves.toBe(true);
 
     expect(SecurityService.recordBiometricAuth).toHaveBeenCalledWith(reason);
   });
