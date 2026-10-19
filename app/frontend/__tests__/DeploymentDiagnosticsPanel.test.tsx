@@ -134,7 +134,7 @@ describe("DeploymentDiagnosticsPanel", () => {
     expect(writeTextMock).toHaveBeenCalledWith("my-branch");
   });
 
-  it.skip("shows '✓' feedback on the copy button after clicking, then reverts", async () => {
+  it("shows '✓' feedback on the copy button after clicking, then reverts", async () => {
     setEnv({
       NEXT_PUBLIC_STELLAR_NETWORK: "testnet",
       NEXT_PUBLIC_VERCEL_ENV: "preview",
@@ -144,13 +144,23 @@ describe("DeploymentDiagnosticsPanel", () => {
     render(<DeploymentDiagnosticsPanel />);
 
     const apiCopyBtn = screen.getByRole("button", { name: /copy api url/i });
+
+    // Click and flush the clipboard.writeText promise so the .then() callback
+    // runs and React state (copyStates[key] = "copied") is applied.
     await act(async () => {
       fireEvent.click(apiCopyBtn);
+      // Let the resolved promise microtask queue drain so .then() fires.
+      await Promise.resolve();
     });
 
     expect(apiCopyBtn.textContent).toBe("✓");
 
-    vi.advanceTimersByTime(2001);
+    // Advance fake timers past the 2000 ms revert timeout and flush the
+    // resulting state update through act() so React re-renders.
+    await act(async () => {
+      vi.advanceTimersByTime(2001);
+    });
+
     expect(apiCopyBtn.textContent).toBe("⧉");
   });
 
