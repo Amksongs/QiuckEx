@@ -137,8 +137,23 @@ export class QuoteService {
     let preflight: QuoteResponseDto["preflight"];
     if (dto.preflight) {
       // Preflight is a best-effort feasibility signal — never blocks quote creation
-      preflight = { feasible: true };
-      this.logger.debug(`Preflight requested for quote ${quoteId} (stub: feasible)`);
+      // Check if at least one candidate path is feasible (has sufficient liquidity and non-zero amount)
+      if (!quotePaths || quotePaths.length === 0) {
+        preflight = { feasible: false, error: "NO_PATH_FOUND" };
+      } else {
+        const primaryPath = quotePaths[0];
+        const srcNum = parseFloat(primaryPath.sourceAmount);
+        const destNum = parseFloat(primaryPath.destinationAmount);
+
+        if (!isFinite(srcNum) || srcNum <= 0 || !isFinite(destNum) || destNum <= 0) {
+          preflight = { feasible: false, error: "INSUFFICIENT_LIQUIDITY" };
+        } else {
+          preflight = { feasible: true };
+        }
+      }
+      this.logger.debug(
+        `Preflight requested for quote ${quoteId} (feasible: ${preflight.feasible}${preflight.error ? `, reason: ${preflight.error}` : ""})`,
+      );
     }
 
     const age = Math.max(0, Math.floor((now - fetchedAt) / 1000));

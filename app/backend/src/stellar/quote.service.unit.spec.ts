@@ -67,10 +67,24 @@ describe("QuoteService", () => {
       });
     });
 
-    it("includes preflight stub when requested", async () => {
-      const svc = makeService();
+    it("returns feasible: true for a valid path payment route when preflight requested", async () => {
+      const svc = makeService([MOCK_PATH]);
       const result = await svc.createQuote({ ...BASE_DTO, preflight: true });
       expect(result.preflight).toEqual({ feasible: true });
+    });
+
+    it("returns feasible: false with reason code when route has no liquidity or invalid amounts", async () => {
+      const infeasiblePath: PathPreviewRow = {
+        ...MOCK_PATH,
+        sourceAmount: "0.0000000",
+        destinationAmount: "0.0000000",
+      };
+      const svc = makeService([infeasiblePath]);
+      const result = await svc.createQuote({ ...BASE_DTO, preflight: true });
+      expect(result.preflight).toEqual({
+        feasible: false,
+        error: "INSUFFICIENT_LIQUIDITY",
+      });
     });
   });
 
