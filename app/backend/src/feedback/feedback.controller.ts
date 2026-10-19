@@ -3,13 +3,16 @@ import { Request } from 'express';
 import { FeedbackService } from './feedback.service';
 import { FeedbackDto } from './feedback.dto';
 import { CustomThrottlerGuard } from '../auth/guards/custom-throttler.guard';
-import { OrganizationRoleGuard } from '../auth/guards/organization-role.guard';
+import { ApiKeyGuard } from '../auth/guards/api-key.guard';
+import { RequireApiKey } from '../auth/decorators/require-api-key.decorator';
+import { RequireScopes } from '../auth/decorators/require-scopes.decorator';
 
 /**
  * Controller handling user feedback/report submissions.
  *
  * - POST /feedback : public endpoint for contributors to submit reports.
- * - GET  /feedback/admin : admin‑only endpoint to retrieve stored reports.
+ * - GET  /feedback/admin : admin‑only endpoint (API key with the `admin` scope)
+ *   to retrieve stored reports.
  */
 @Controller('feedback')
 export class FeedbackController {
@@ -24,7 +27,9 @@ export class FeedbackController {
   }
 
   @Get('admin')
-  @UseGuards(OrganizationRoleGuard) // admin guard (placeholder)
+  @UseGuards(ApiKeyGuard)
+  @RequireApiKey() // ApiKeyGuard treats a missing key as public without this
+  @RequireScopes('admin')
   async adminList() {
     return await this.feedbackService.listAll();
   }
