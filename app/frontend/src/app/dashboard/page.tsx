@@ -69,7 +69,6 @@ function DashboardContent() {
   const { data, error, loading, callApi } = useApi<DashboardResponse>();
   const [userBids, setUserBids] = useState<UserBid[]>([]);
   const [userListings, setUserListings] = useState<UserListing[]>([]);
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [feedRetryCount, setFeedRetryCount] = useState(0);
 
   const [metricsData, setMetricsData] = useState<AnalyticsData | null>(null);
@@ -100,15 +99,6 @@ function DashboardContent() {
     void fetchUserBids().then(setUserBids);
     void fetchUserListings().then(setUserListings);
   }, [callApi, feedRetryCount]);
-
-  useEffect(() => {
-    if (!statusMessage) {
-      return;
-    }
-
-    const timer = window.setTimeout(() => setStatusMessage(null), 3200);
-    return () => window.clearTimeout(timer);
-  }, [statusMessage]);
 
   const highlightedTransaction = searchParams.get("tx");
   const highlightedBid = searchParams.get("bid");
@@ -308,9 +298,10 @@ function DashboardContent() {
             </Link>
             <button
               type="button"
-              onClick={() => setStatusMessage("Withdraw flow coming soon.")}
-              className={`rounded-xl bg-indigo-500 px-4 py-3 font-semibold text-white shadow-lg transition hover:bg-indigo-400 ${FOCUS_RING_CLASS}`}
-              aria-label="Withdraw funds"
+              disabled
+              className={`cursor-not-allowed rounded-xl bg-surface-strong px-4 py-3 font-semibold text-muted opacity-60 shadow-none ${FOCUS_RING_CLASS}`}
+              aria-label="Withdraw funds (currently unavailable)"
+              title="Withdrawals are not available yet."
             >
               Withdraw funds
             </button>
@@ -323,9 +314,8 @@ function DashboardContent() {
               {spotlightMessage}
             </p>
           ) : null}
-          <p aria-live="polite" className="text-sm text-muted">
-            {statusMessage ??
-              "Notifications can jump you directly into payments, active bids, and listing updates."}
+          <p className="text-sm text-muted">
+            Notifications can jump you directly into payments, active bids, and listing updates.
           </p>
         </div>
 
