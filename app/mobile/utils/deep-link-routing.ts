@@ -26,6 +26,18 @@ export type DeepLinkResolution =
   | { error: string }
   | { ignored: true };
 
+function collectSearchParams(url: URL): Record<string, string> {
+  const params: Record<string, string> = {};
+  url.searchParams.forEach((value, key) => {
+    params[key] = value;
+  });
+  return params;
+}
+
+function splitSegments(pathname: string): string[] {
+  return pathname.replace(/^\/+/, '').split('/').filter(Boolean);
+}
+
 export function parseTransactionDeepLink(
   raw: string,
 ): { id: string; params: Record<string, string> } | null {
@@ -33,16 +45,16 @@ export function parseTransactionDeepLink(
     const url = new URL(raw);
 
     if (url.protocol === `${QUICKEX_SCHEME}:`) {
-      const segments = url.pathname
-        .replace(/^\/+/, '')
-        .split('/')
-        .filter(Boolean);
+      // The WHATWG URL parser treats the first segment of a scheme URL as the
+      // hostname (e.g. quickex://transaction/12345 -> hostname = 'transaction',
+      // pathname = '/12345'). Combine the hostname with the pathname segments
+      // so both the canonical form and the explicit-path form resolve.
+      const segments = [
+        ...(url.hostname ? [url.hostname] : []),
+        ...splitSegments(url.pathname),
+      ];
       if (segments.length >= 2 && segments[0] === 'transaction') {
-        const params: Record<string, string> = {};
-        url.searchParams.forEach((value, key) => {
-          params[key] = value;
-        });
-        return { id: segments[1], params };
+        return { id: segments[1], params: collectSearchParams(url) };
       }
     }
 
@@ -50,16 +62,9 @@ export function parseTransactionDeepLink(
       (url.protocol === 'https:' || url.protocol === 'http:') &&
       QUICKEX_HOSTS.includes(url.hostname)
     ) {
-      const segments = url.pathname
-        .replace(/^\/+/, '')
-        .split('/')
-        .filter(Boolean);
+      const segments = splitSegments(url.pathname);
       if (segments.length >= 2 && segments[0] === 'transaction') {
-        const params: Record<string, string> = {};
-        url.searchParams.forEach((value, key) => {
-          params[key] = value;
-        });
-        return { id: segments[1], params };
+        return { id: segments[1], params: collectSearchParams(url) };
       }
     }
   } catch {
@@ -68,9 +73,9 @@ export function parseTransactionDeepLink(
   return null;
 }
 
-export function isQuickExLink(raw: string): boolean {
+export function isQuickExLink(lint: string): boolean {
   try {
-    const url = new URL(raw);
+    const url = new URL(link);
     return (
       url.protocol === `${QUICKEX_SCHEME}:` ||
       ((url.protocol === 'https:' || url.protocol === 'http:') &&
@@ -86,12 +91,15 @@ function looksLikePaymentLink(raw: string): boolean {
     const url = new URL(raw);
 
     if (url.protocol === `${QUICKEX_SCHEME}:`) {
-      const segments = url.pathname.replace(/^\/+/, '').split('/').filter(Boolean);
+      const segments = [
+        ...(url.hostname ? [url.hostname] : []),
+        ...splitSegments(url.pathname),
+      ];
       return segments.length === 0 || segments[0] !== 'transaction';
     }
 
     if ((url.protocol === 'https:' || url.protocol === 'http:') && QUICKEX_HOSTS.includes(url.hostname)) {
-      const segments = url.pathname.replace(/^\/+/, '').split('/').filter(Boolean);
+      const segments = splitSegments(url.pathname);
       return segments.length === 0 || segments[0] !== 'transaction';
     }
 
@@ -112,7 +120,7 @@ export function resolveDeepLink(raw: string): DeepLinkResolution {
   if (!IS_DEBUG_BUILD) {
     try {
       const url = new URL(trimmed);
-      const segments = url.pathname.replace(/^\/+/, '').split('/').filter(Boolean);
+      const segments = splitSegments(url.pathname);
       const firstSegment = segments[0] ? `/${segments[0]}` : '';
       // The scheme form (quickex://deep-link-debug) puts the route in the host.
       const hostSegment = url.hostname ? `/${url.hostname}` : '';
