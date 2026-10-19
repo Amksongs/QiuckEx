@@ -9,6 +9,8 @@ export interface WebhookDispatchResult {
   error?: string;
 }
 
+const WEBHOOK_TIMEOUT_MS = 10_000;
+
 @Injectable()
 export class ContractChangeWebhookDispatcher {
   private readonly logger = new Logger(
@@ -31,6 +33,8 @@ export class ContractChangeWebhookDispatcher {
 
     await Promise.allSettled(
       webhooks.map(async (webhook) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT_MS);
         try {
           const signature = createHmac('sha256', webhook.secret)
             .update(body)
@@ -44,6 +48,7 @@ export class ContractChangeWebhookDispatcher {
               'X-QuickEx-Event': 'contract_registry.changed',
             },
             body,
+            signal: controller.signal,
           });
 
           results.push({
@@ -53,14 +58,19 @@ export class ContractChangeWebhookDispatcher {
             httpStatus: response.status,
           });
         } catch (error) {
-          const message =
-            error instanceof Error ? error.message : 'Unknown error';
+          const message = controller.signal.aborted
+            ? `Webhook delivery timed out after ${WEBHOOK_TIMEOUT_MS}ms`
+            : error instanceof Error
+              ? error.message
+              : 'Unknown error';
           results.push({
             webhookId: webhook.id,
             url: webhook.webhookUrl,
             success: false,
             error: message,
           });
+        } finally {
+          clearTimeout(timer);
         }
       }),
     );
