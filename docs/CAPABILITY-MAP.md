@@ -59,7 +59,7 @@ NestJS app, ~38 modules wired in `src/app.module.ts`. Supabase (40 migrations) a
 | Payment links (metadata, status, bulk, recurring, scam alerts) | `src/links` | **Live** | Recurring endpoints have no client consumer yet. |
 | Transactions (Horizon-backed, compose/build/simulate) | `src/transactions` | **Live** | Compose/simulate writes are **Experimental** (flag-gated, see below). `build` is a compatibility alias of `compose`. |
 | Recent payments | `src/payments` | **Live** | Thin controller over `HorizonService.getPayments`; no client consumer yet. |
-| Stellar (verified assets, path payments, quotes) | `src/stellar` | **Partial** | Assets and path previews are Live; the quote **preflight is a stub that always reports feasible** (`quote.service.ts` L141). |
+| Stellar (verified assets, path payments, quotes) | `src/stellar` | **Live** | Assets, path previews, and quote preflight path feasibility checks are Live. |
 | Analytics (report, export, time-series) | `src/analytics` | **Live** | — |
 | API keys | `src/api-keys` | **Live** | — |
 | Notifications & webhooks | `src/notifications` | **Live** | Disabled in local dev (local Supabase check in `app.module.ts`). |
@@ -131,7 +131,7 @@ A separate env-var rollback guard exists at `app/backend/flags.js` (`FEATURE_<NA
 2. **Marketplace bids / real-time updates** — there is no backend or WebSocket server behind them; the frontend generates the data locally.
 3. **Frontend payment signing** — `ActivePaymentState.tsx` produces a fake XDR. No transaction is actually signed or submitted from that state.
 4. **Reconciliation results** — observed values mirror expected values, so "everything reconciles" is not evidence of correctness.
-5. **Stellar quote preflight** — always reports feasible; do not treat it as a real feasibility check.
+5. **Stellar quote preflight** — performs path feasibility verification against computed payment routes.
 6. **Mobile escrow registry sync** — 404s today due to the `/api` path prefix (mismatch #1). Fix the path before building on it.
 7. **`admin/feature-flags` and `admin/audit`** — unguarded endpoints; adding guards must land together with auth-header changes in the frontend admin pages (mismatch #7).
 8. **Mainnet anything on-chain** — the contract is not deployed to mainnet and all `mainnet.*` flags default to disabled. Treat all on-chain flows as testnet-only.
