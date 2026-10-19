@@ -23,6 +23,34 @@ export interface HorizonPaymentRecord {
     created_at: string;
 }
 
+/** Record returned by Horizon's /transactions/:hash endpoint. */
+export interface HorizonTransactionRecord {
+    id: string;
+    hash: string;
+    successful: boolean;
+    source_account?: string;
+    memo?: string;
+    created_at?: string;
+    [key: string]: unknown;
+}
+
+/** Record returned by Horizon's /transactions/:hash/operations endpoint. */
+export interface HorizonPaymentOperationRecord {
+    id?: string;
+    type: string;
+    transaction_successful?: boolean;
+    transaction_hash?: string;
+    source_account?: string;
+    from?: string;
+    to?: string;
+    amount?: string;
+    asset_type?: string;
+    asset_code?: string;
+    asset_issuer?: string;
+    created_at?: string;
+    [key: string]: unknown;
+}
+
 @Injectable()
 export class HorizonService {
     private readonly logger = new Logger(HorizonService.name);
@@ -121,6 +149,71 @@ export class HorizonService {
 
                 if (status === 404) {
                     this.logger.debug(`No payment history for ${accountId} on Horizon`);
+                    return [];
+                }
+                if (status >= 400) {
+                    this.handleHorizonError(this.toHorizonError(status));
+                }
+                return data?._embedded?.records ?? [];
+            },
+        );
+    }
+
+    /**
+     * Fetch a single transaction by hash from Horizon.
+     * Returns null when the transaction does not exist (404).
+     * Single attempt: no retry loop, bounded by one request timeout.
+     */
+    async getTransactionByHash(txHash: string): Promise<HorizonTransactionRecord | null> {
+        return withSpan(
+            'horizon.getTransactionByHash',
+            {
+                'rpc.system': 'horizon',
+                'horizon.tx_hash': txHash,
+            },
+            async (span) => {
+                const { status, data } = await this.fetchJson<HorizonTransactionRecord>(
+                    `/transactions/${encodeURIComponent(txHash)}`,
+                );
+                span.setAttribute('http.status_code', status);
+
+                if (status === 404) {
+                    this.logger.debug(`Transaction ${txHash} not found on Horizon`);
+                    return null;
+                }
+                if (status >= 400) {
+                    this.handleHorizonError(this.toHorizonError(status));
+                }
+                return data;
+            },
+        );
+    }
+
+    /**
+     * Fetch operations for a single transaction by hash from Horizon.
+     * Returns an empty list when the transaction does not exist (404).
+     * Single attempt: no retry loop, bounded by one request timeout.
+     */
+    async getTransactionOperations(
+        txHash: string,
+        limit: number = 100,
+    ): Promise<HorizonPaymentOperationRecord[]> {
+        return withSpan(
+            'horizon.getTransactionOperations',
+            {
+                'rpc.system': 'horizon',
+                'horizon.tx_hash': txHash,
+            },
+            async (span) => {
+                const { status, data } = await this.fetchJson<{
+                    _embedded?: { records?: HorizonPaymentOperationRecord[] };
+                }>(
+                    `/transactions/${encodeURIComponent(txHash)}/operations?limit=${limit}&order=asc`,
+                );
+                span.setAttribute('http.status_code', status);
+
+                if (status === 404) {
+                    this.logger.debug(`No operations found for transaction ${txHash} on Horizon`);
                     return [];
                 }
                 if (status >= 400) {

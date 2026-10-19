@@ -69,6 +69,7 @@ export interface MarketplaceListing {
   sold_at: string | null;
   buyer_public_key: string | null;
   final_price: number | null;
+  payment_tx_hash?: string | null;
 }
 
 export interface MarketplaceBid {
@@ -77,8 +78,17 @@ export interface MarketplaceBid {
   bidder_public_key: string;
   bid_amount: number;
   status: "pending" | "accepted" | "rejected" | "cancelled";
+  payment_tx_hash?: string | null;
+  payment_verified_at?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface VerifiedMarketplacePayment {
+  paymentTxHash: string;
+  verifiedAmount: number;
+  verifiedPayer: string;
+  verifiedRecipient: string;
 }
 
 export interface VerifiedAssetDbRecord {
@@ -1045,15 +1055,72 @@ export class SupabaseService {
     return data as MarketplaceBid | null;
   }
 
+  async isMarketplacePaymentTxUsed(
+    txHash: string,
+    excludeBidId?: string,
+  ): Promise<boolean> {
+    const normalized = txHash.trim().toLowerCase();
+    let query = this.client
+      .from("username_bids")
+      .select("id")
+      .eq("payment_tx_hash", normalized)
+      .eq("status", "accepted")
+      .limit(1);
+
+    if (excludeBidId) {
+      query = query.neq("id", excludeBidId);
+    }
+
+    const { data, error } = await query.maybeSingle();
+    if (error) this.handleError(error);
+    if (data) return true;
+
+    const { data: soldListing, error: listingError } = await this.client
+      .from("username_marketplace")
+      .select("id")
+      .eq("payment_tx_hash", normalized)
+      .eq("status", "sold")
+      .limit(1)
+      .maybeSingle();
+    if (listingError) this.handleError(listingError);
+    return Boolean(soldListing);
+  }
+
   async acceptBid(
     listingId: string,
     bidId: string,
     sellerPublicKey: string,
+    payment: VerifiedMarketplacePayment,
   ): Promise<void> {
+    if (
+      !payment?.paymentTxHash ||
+      !/^[0-9a-f]{64}$/i.test(payment.paymentTxHash.trim())
+    ) {
+      throw new Error(
+        "PAYMENT_REQUIRED: A valid 64-character Stellar transaction hash is required to accept a bid",
+      );
+    }
+    if (
+      payment.verifiedAmount === undefined ||
+      payment.verifiedAmount === null ||
+      !Number.isFinite(payment.verifiedAmount) ||
+      payment.verifiedAmount <= 0 ||
+      !payment.verifiedPayer ||
+      !payment.verifiedRecipient
+    ) {
+      throw new Error(
+        "PAYMENT_NOT_VERIFIED: Verified on-chain payment details are required to accept a bid",
+      );
+    }
+
     const { error } = await this.client.rpc("accept_username_bid", {
       p_listing_id: listingId,
       p_bid_id: bidId,
       p_seller_public_key: sellerPublicKey,
+      p_payment_tx_hash: payment.paymentTxHash.trim().toLowerCase(),
+      p_verified_amount: payment.verifiedAmount,
+      p_verified_payer: payment.verifiedPayer,
+      p_verified_recipient: payment.verifiedRecipient,
     });
     if (error) this.handleError(error);
   }
