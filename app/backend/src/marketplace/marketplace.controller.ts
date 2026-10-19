@@ -210,21 +210,27 @@ export class MarketplaceController {
 
   @Post(':listingId/accept-bid/:bidId')
   @RateLimitTier('mutation')
-  @ApiOperation({ summary: 'Accept a bid — atomically transfers username ownership' })
+  @ApiOperation({ summary: 'Accept a bid — atomically transfers username ownership after verifying on-chain payment' })
   @ApiParam({ name: 'listingId', description: 'Listing UUID' })
   @ApiParam({ name: 'bidId', description: 'Bid UUID' })
   @ApiBody({ type: AcceptBidDto })
   @ApiResponse({ status: 200, description: 'Bid accepted and ownership transferred' })
-  @ApiResponse({ status: 400, description: 'Bid not pending or listing not active' })
+  @ApiResponse({ status: 400, description: 'Bid not pending, listing not active, or payment missing/unverified/mismatched' })
   @ApiResponse({ status: 403, description: 'Not the seller' })
   @ApiResponse({ status: 404, description: 'Listing or bid not found' })
+  @ApiResponse({ status: 409, description: 'Payment transaction already used' })
   async acceptBid(
     @Param('listingId') listingId: string,
     @Param('bidId') bidId: string,
     @Body() body: AcceptBidDto,
   ) {
     try {
-      await this.marketplaceService.acceptBid(listingId, bidId, body.sellerPublicKey);
+      await this.marketplaceService.acceptBid(
+        listingId,
+        bidId,
+        body.sellerPublicKey,
+        body.paymentTxHash,
+      );
       return { ok: true };
     } catch (err) {
       if (err instanceof MarketplaceError) {
@@ -243,6 +249,7 @@ export class MarketplaceController {
       case MarketplaceErrorCode.USERNAME_NOT_OWNED:
         throw new ForbiddenException({ code: err.code, message: err.message });
       case MarketplaceErrorCode.ALREADY_LISTED:
+      case MarketplaceErrorCode.PAYMENT_ALREADY_USED:
         throw new ConflictException({ code: err.code, message: err.message });
       default:
         throw new BadRequestException({ code: err.code, message: err.message });

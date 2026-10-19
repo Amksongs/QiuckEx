@@ -351,4 +351,81 @@ describe('HorizonService', () => {
             );
         });
     });
+
+    describe('getTransactionByHash', () => {
+        const txHash =
+            'a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0';
+
+        it('fetches transaction details by hash from Horizon', async () => {
+            const txRecord = {
+                id: txHash,
+                hash: txHash,
+                successful: true,
+                source_account: 'GBIDDER123',
+            };
+            (global.fetch as jest.Mock).mockResolvedValueOnce({
+                ok: true,
+                status: 200,
+                json: async () => txRecord,
+            } as Response);
+
+            const result = await service.getTransactionByHash(txHash);
+
+            expect(result).toEqual(txRecord);
+            expect(global.fetch as jest.Mock).toHaveBeenCalledWith(
+                `https://horizon-testnet.stellar.org/transactions/${txHash}`,
+                expect.objectContaining({ signal: expect.any(AbortSignal) }),
+            );
+        });
+
+        it('returns null when transaction is not found on Horizon (404)', async () => {
+            (global.fetch as jest.Mock).mockResolvedValueOnce({
+                ok: false,
+                status: 404,
+            } as Response);
+
+            await expect(service.getTransactionByHash(txHash)).resolves.toBeNull();
+        });
+    });
+
+    describe('getTransactionOperations', () => {
+        const txHash =
+            'a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0';
+
+        it('fetches operations for a transaction hash from Horizon', async () => {
+            const ops = [
+                {
+                    type: 'payment',
+                    from: 'GBIDDER123',
+                    to: 'GSELLER456',
+                    amount: '150.0000000',
+                    asset_type: 'native',
+                },
+            ];
+            (global.fetch as jest.Mock).mockResolvedValueOnce({
+                ok: true,
+                status: 200,
+                json: async () => ({ _embedded: { records: ops } }),
+            } as Response);
+
+            const result = await service.getTransactionOperations(txHash);
+
+            expect(result).toEqual(ops);
+            expect(global.fetch as jest.Mock).toHaveBeenCalledWith(
+                `https://horizon-testnet.stellar.org/transactions/${txHash}/operations?limit=100&order=asc`,
+                expect.objectContaining({ signal: expect.any(AbortSignal) }),
+            );
+        });
+
+        it('returns an empty list when transaction operations return 404', async () => {
+            (global.fetch as jest.Mock).mockResolvedValueOnce({
+                ok: false,
+                status: 404,
+            } as Response);
+
+            await expect(
+                service.getTransactionOperations(txHash),
+            ).resolves.toEqual([]);
+        });
+    });
 });
