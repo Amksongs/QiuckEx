@@ -11,6 +11,26 @@ import { EnvConfig } from "./env.schema";
 export class AppConfigService {
   constructor(private readonly configService: ConfigService<EnvConfig, true>) {}
 
+  getBootstrapBase() {
+    return {
+      network: {
+        environment: this.network,
+        rpcUrl: this.sorobanRpcUrl || "",
+        horizonUrl: this.horizonUrl || "",
+        networkPassphrase: this.stellarNetworkPassphrase,
+      },
+      contracts: {
+        registryId: this.quickexContractId || "",
+        routerId: this.routerContractId || "",
+        allowedTokens: this.allowedTokens,
+      },
+      backendMetadata: {
+        version: this.appVersion,
+        apiUrl: this.apiBaseUrl,
+      },
+    };
+  }
+
   /**
    * Get the server port
    */
@@ -124,6 +144,48 @@ export class AppConfigService {
   }
 
   /**
+   * Public API base URL for client bootstrapping.
+   */
+  get publicApiUrl(): string | undefined {
+    return this.configService.get("PUBLIC_API_URL", { infer: true });
+  }
+
+  /**
+   * Parsed list of explicitly allowed CORS origins.
+   * Sourced from the CORS_ALLOWED_ORIGINS env var (comma-separated).
+   */
+  get corsAllowedOrigins(): string[] {
+    const raw = this.configService.get('CORS_ALLOWED_ORIGINS', { infer: true });
+    return raw ? raw.split(',').map((o) => o.trim()).filter(Boolean) : [];
+  }
+
+  /**
+   * Vercel project slug used to allow preview deployment URLs.
+   * When set, https://<slug>-*.vercel.app origins are permitted.
+   */
+  get corsVercelProject(): string | undefined {
+    return this.configService.get('CORS_VERCEL_PROJECT', { infer: true });
+  }
+
+  /**
+   * Contract method allowlist enforcement mode.
+   */
+  get contractMethodAllowlistMode(): "enforce" | "off" {
+    return this.configService.get("CONTRACT_METHOD_ALLOWLIST_MODE", {
+      infer: true,
+    });
+  }
+
+  /**
+   * Raw JSON string describing the contract method allowlist, or undefined if unset.
+   */
+  get contractMethodAllowlistJson(): string | undefined {
+    return this.configService.get("CONTRACT_METHOD_ALLOWLIST_JSON", {
+      infer: true,
+    });
+  }
+
+  /**
    * Check if running on testnet
    */
   get isTestnet(): boolean {
@@ -135,6 +197,14 @@ export class AppConfigService {
    */
   get isMainnet(): boolean {
     return this.network === "mainnet";
+  }
+
+  /**
+   * GitHub webhook secret (optional). When unset, the deployment webhook
+   * endpoint is unavailable and returns 503.
+   */
+  get githubWebhookSecret(): string | undefined {
+    return this.configService.get("GITHUB_WEBHOOK_SECRET", { infer: true });
   }
 
   /**
@@ -178,6 +248,53 @@ export class AppConfigService {
   }
 
   /**
+   * Whether the scheduled reconciliation worker is enabled (BE-124).
+   */
+  get reconciliationEnabled(): boolean {
+    return this.configService.get("RECONCILIATION_ENABLED", { infer: true });
+  }
+
+  /**
+   * Cron expression for scheduled reconciliation runs (BE-124).
+   */
+  get reconciliationCronExpression(): string {
+    return this.configService.get("RECONCILIATION_CRON_EXPRESSION", {
+      infer: true,
+    });
+  }
+
+  /**
+   * Payment count discrepancy that raises a drift alert when exceeded (BE-124).
+   */
+  get reconciliationDriftCountThreshold(): number {
+    return this.configService.get("RECONCILIATION_DRIFT_COUNT_THRESHOLD", {
+      infer: true,
+    });
+  }
+
+  /**
+   * Payment amount discrepancy (in stroops) that raises a drift alert when
+   * exceeded. Kept as a string so it can preserve full precision for BigInt
+   * comparisons (BE-124).
+   */
+  get reconciliationDriftAmountThresholdStroops(): string {
+    return this.configService.get(
+      "RECONCILIATION_DRIFT_AMOUNT_THRESHOLD_STROOPS",
+      { infer: true },
+    );
+  }
+
+  /**
+   * Consecutive failed or skipped reconciliation runs that raise an alert (BE-124).
+   */
+  get reconciliationConsecutiveFailureAlertThreshold(): number {
+    return this.configService.get(
+      "RECONCILIATION_CONSECUTIVE_FAILURE_ALERT_THRESHOLD",
+      { infer: true },
+    );
+  }
+
+  /**
    * QuickEx Soroban contract id (optional). Used for ingestion and soroban preflight.
    */
   get quickexContractId(): string | undefined {
@@ -203,6 +320,24 @@ export class AppConfigService {
    */
   get horizonUrl(): string | undefined {
     return this.configService.get("HORIZON_URL", { infer: true });
+  }
+
+  /**
+   * Timeout in milliseconds for outbound Horizon requests made by HorizonService.
+   */
+  get horizonRequestTimeoutMs(): number {
+    return this.configService.get("HORIZON_REQUEST_TIMEOUT_MS", {
+      infer: true,
+    });
+  }
+
+  /**
+   * Timeout in milliseconds for scam-alerts external blocklist fetches.
+   */
+  get scamAlertsFetchTimeoutMs(): number {
+    return this.configService.get("SCAM_ALERTS_FETCH_TIMEOUT_MS", {
+      infer: true,
+    });
   }
 
   get sorobanRpcUrl(): string | undefined {
@@ -232,5 +367,265 @@ export class AppConfigService {
    */
   get isPaymentSigningConfigured(): boolean {
     return !!this.stellarSecretKey;
+  }
+
+  /**
+   * Indexer lag threshold in ledgers
+   */
+  get indexerLagThresholdLedgers(): number {
+    return this.configService.get("INDEXER_LAG_THRESHOLD_LEDGERS", { infer: true });
+  }
+
+  /**
+   * Whether the indexer lag guard is enabled
+   */
+  get indexerLagGuardEnabled(): boolean {
+    return this.configService.get("INDEXER_LAG_GUARD_ENABLED", { infer: true });
+  }
+
+  /**
+   * Admin override to disable lag guard temporarily
+   */
+  get indexerLagGuardOverride(): boolean {
+    return this.configService.get("INDEXER_LAG_GUARD_OVERRIDE", { infer: true });
+  }
+
+  /**
+   * Maximum allowed age of the newest ingestion cursor, in seconds, before the
+   * health check reports the ingestion pipeline as degraded.
+   */
+  get ingestionLagThresholdSeconds(): number {
+    return this.configService.get("INGESTION_LAG_THRESHOLD_SECONDS", {
+      infer: true,
+    });
+  }
+
+  /**
+   * Whether the dead letter queue depth/age monitor is enabled
+   */
+  get dlqMonitorEnabled(): boolean {
+    return this.configService.get("DLQ_MONITOR_ENABLED", { infer: true });
+  }
+
+  /**
+   * Dead letter queue depth (per job type) that triggers an alert
+   */
+  get dlqAlertDepthThreshold(): number {
+    return this.configService.get("DLQ_ALERT_DEPTH_THRESHOLD", { infer: true });
+  }
+
+  /**
+   * Age in ms of the oldest dead-lettered job (per job type) that triggers an alert
+   */
+  get dlqAlertAgeThresholdMs(): number {
+    return this.configService.get("DLQ_ALERT_AGE_THRESHOLD_MS", { infer: true });
+  }
+
+  /**
+   * Days to retain abuse signals before auto-pruning
+   */
+  get abuseSignalRetentionDays(): number {
+    return this.configService.get("ABUSE_SIGNAL_RETENTION_DAYS", {
+      infer: true,
+    });
+  }
+
+  /**
+   * Abuse score threshold for flagging as suspicious (0-100)
+   */
+  get abuseSignalScoreThreshold(): number {
+    return this.configService.get("ABUSE_SIGNAL_SCORE_THRESHOLD", {
+      infer: true,
+    });
+  }
+
+  /**
+   * Enable geo-lite lookups for abuse signals
+   */
+  get abuseSignalGeoEnabled(): boolean {
+    return this.configService.get("ABUSE_SIGNAL_GEO_ENABLED", {
+      infer: true,
+    });
+  }
+
+  /**
+   * Salt for IP/UA hashing in abuse signals
+   */
+  get abuseSignalHashSalt(): string {
+    return this.configService.get("ABUSE_SIGNAL_HASH_SALT", { infer: true });
+  }
+
+  /**
+   * Retention window (hours) for completed idempotency key records (BE-109)
+   */
+  get idempotencyRetentionHours(): number {
+    return this.configService.get("IDEMPOTENCY_RETENTION_HOURS", {
+      infer: true,
+    });
+  }
+
+  /**
+   * Overlap window (hours) for key rotation grace period (BE-118)
+   */
+  get apiKeyRotationOverlapHours(): number {
+    return this.configService.get("API_KEY_ROTATION_OVERLAP_HOURS", {
+      infer: true,
+    });
+  }
+
+  // ====================================================================
+  // NEW ACCESSORS FOR BOOTSTRAP PAYLOAD
+  // ====================================================================
+
+  /**
+   * Get the API base URL for frontend routing
+   */
+  get apiBaseUrl(): string {
+    return this.configService.get("API_BASE_URL", { infer: true }) || "http://localhost:3000";
+  }
+
+  /**
+   * Get the current application version
+   */
+  get appVersion(): string {
+    return this.configService.get("APP_VERSION", { infer: true }) || process.env.npm_package_version || "1.0.0";
+  }
+
+  get mobileMinSupportedVersion(): string {
+    return this.configService.get("MOBILE_MIN_SUPPORTED_VERSION", { infer: true });
+  }
+
+  get mobileRecommendedVersion(): string {
+    return this.configService.get("MOBILE_RECOMMENDED_VERSION", { infer: true });
+  }
+
+  get mobileLatestVersion(): string {
+    return this.configService.get("MOBILE_LATEST_VERSION", { infer: true });
+  }
+
+  get mobileIosStoreUrl(): string {
+    return this.configService.get("MOBILE_IOS_STORE_URL", { infer: true });
+  }
+
+  get mobileAndroidStoreUrl(): string {
+    return this.configService.get("MOBILE_ANDROID_STORE_URL", { infer: true });
+  }
+
+  get mobileReleaseNotes(): string[] {
+    const raw = this.configService.get("MOBILE_RELEASE_NOTES", { infer: true });
+    return raw ? raw.split("|").map((note) => note.trim()).filter(Boolean) : [];
+  }
+
+  /**
+   * Get the Router Contract ID
+   */
+  get routerContractId(): string | undefined {
+    return this.configService.get("ROUTER_CONTRACT_ID", { infer: true });
+  }
+
+  /**
+   * Get predefined allowed tokens
+   */
+  get allowedTokens(): string[] {
+    const raw = this.configService.get("ALLOWED_TOKENS", { infer: true });
+    return raw ? raw.split(",").map((t) => t.trim()).filter(Boolean) : [];
+  }
+
+  get anchorDirectoryJson(): string | undefined {
+    return this.configService.get("ANCHOR_DIRECTORY_JSON", { infer: true });
+  }
+
+  /**
+   * JSON mapping of anchor domains to their webhook secrets.
+   */
+  get anchorWebhookSecrets(): Record<string, string> {
+    const raw = this.configService.get("ANCHOR_WEBHOOK_SECRETS", { infer: true });
+    if (!raw) return {};
+    try {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+        return parsed as Record<string, string>;
+      }
+    } catch {
+      // Ignore invalid JSON format
+    }
+    return {};
+  }
+
+  /**
+   * Default fallback shared webhook secret for anchors without a specific secret.
+   */
+  get anchorWebhookSecret(): string | undefined {
+    return this.configService.get("ANCHOR_WEBHOOK_SECRET", { infer: true });
+  }
+
+  /**
+   * Get Stellar Network Passphrase
+   */
+  get stellarNetworkPassphrase(): string {
+    return (
+      this.configService.get("STELLAR_NETWORK_PASSPHRASE", { infer: true }) ||
+      (this.isTestnet
+        ? "Test SDF Network ; September 2015"
+        : "Public Global Stellar Network ; September 2015")
+    );
+  }
+
+  // ── Export artifact storage (BE-102) ───────────────────────────────────────
+
+  /** Retention period for export artifacts in object storage (hours). */
+  get exportArtifactTtlHours(): number {
+    return this.configService.get('EXPORT_ARTIFACT_TTL_HOURS', { infer: true });
+  }
+
+  /**
+   * HMAC-SHA256 secret used to sign export download tokens.
+   * Must be at least 32 characters.  Rotate by cycling this env var.
+   */
+  get exportDownloadSecret(): string {
+    return this.configService.get('EXPORT_DOWNLOAD_SECRET', { infer: true });
+  }
+
+  // ── OpenTelemetry tracing (BE-113) ─────────────────────────────────────────
+  // Note: the tracing SDK itself boots in src/tracing/tracing.ts before Nest's
+  // DI container exists, so it reads process.env directly via
+  // resolveOtelConfig(). These getters exist so the rest of the app (and
+  // tests) can inspect the same settings through the usual typed config.
+
+  /** Root span sampling ratio (0.0-1.0). Kept low by default for overhead. */
+  get otelTraceSampleRate(): number {
+    return this.configService.get('OTEL_TRACE_SAMPLE_RATE', { infer: true });
+  }
+
+  get otelServiceName(): string {
+    return this.configService.get('OTEL_SERVICE_NAME', { infer: true });
+  }
+
+  /** OTLP/HTTP traces endpoint override, if explicitly configured. */
+  get otelExporterOtlpTracesEndpoint(): string | undefined {
+    return this.configService.get('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT', {
+      infer: true,
+    });
+  }
+
+  get otelExporterOtlpEndpoint(): string | undefined {
+    return this.configService.get('OTEL_EXPORTER_OTLP_ENDPOINT', {
+      infer: true,
+    });
+  }
+
+  /**
+   * Whether local/dev-only stealth privacy debug endpoints are explicitly enabled (#1215).
+   * Always returns false in production environments regardless of the env var.
+   */
+  get privacyDebugEndpointsEnabled(): boolean {
+    if (this.isProduction || this.environmentName === 'production') {
+      return false;
+    }
+    return Boolean(
+      this.configService.get('PRIVACY_DEBUG_ENDPOINTS_ENABLED', {
+        infer: true,
+      }),
+    );
   }
 }

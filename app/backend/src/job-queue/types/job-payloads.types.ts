@@ -21,7 +21,40 @@ export interface WebhookDeliveryPayload {
   
   /** Unique identifier for this event */
   eventId: string;
-  
+
+  /** Preview scope identifier when the event originated from a preview environment. */
+  previewScope?: string;
+
+  /** Correlation id of the originating HTTP request/event, propagated for end-to-end tracing. */
+  correlationId?: string;
+
+  /**
+   * Shared secret used to HMAC-sign the request body.
+   *
+   * Signatures use the canonical `sha256=HMAC-SHA256(secret, "{timestamp}.{body}")`
+   * form shared with the notifications webhook provider, delivered as
+   * `X-QuickEx-Signature` alongside `X-QuickEx-Timestamp`. When absent the
+   * request is sent unsigned (see WebhookDeliveryHandler.execute).
+   *
+   * The secret is snapshotted into the payload rather than re-read from
+   * notification preferences on each attempt. That is deliberate: if the user
+   * rotates their secret while a delivery is queued, re-reading would make
+   * attempt 2 sign with a different key than attempt 1, and a retry could not
+   * be verified against the secret the receiver already accepted. The trade-off
+   * is that the secret is stored on the job row, so `jobs.payload` is
+   * credential-bearing and must be access-controlled accordingly.
+   */
+  signingSecret?: string;
+
+  /**
+   * ID of the job that requested this delivery, when the delivery is a
+   * downstream step of another job (e.g. an export generation job).
+   *
+   * Used to surface a permanent delivery failure on the parent job's record
+   * instead of silently reporting success.
+   */
+  relatedJobId?: string;
+
   /** Event-specific payload data */
   payload: Record<string, unknown>;
 }
@@ -102,4 +135,17 @@ export interface StellarReconnectPayload {
   
   /** Last cursor position before disconnection */
   lastCursor: string;
+}
+
+/**
+ * SEP-24 anchor transaction status poll job payload.
+ * Triggers a full poll cycle against all in-flight SEP-24 ramp transactions.
+ */
+export interface Sep24StatusPollPayload {
+  /**
+   * Who triggered this poll run.
+   * 'cron'   — scheduled tick from Sep24PollingWorkerService.
+   * 'manual' — triggered by an admin action or test.
+   */
+  triggeredBy: 'cron' | 'manual';
 }

@@ -10,11 +10,9 @@
     "sourceMap": true,
     "outDir": "./dist",
     "rootDir": "./",
-    "baseUrl": "./",
     "incremental": true,
-    "skipLibCheck": true,
-    "types": ["node", "jest"]
+    "skipLibCheck": true
   },
-  "include": ["src/**/*", "test/**/*", "*.config.ts", "*.setup.ts"],
+  "include": ["src/**/*", "test/**/*", "perf/**/*", "*.config.ts", "*.setup.ts"],
   "exclude": ["node_modules", "dist"]
 }

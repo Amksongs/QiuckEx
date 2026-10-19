@@ -7,6 +7,7 @@ const mockRegistry = {
   registerMetric: jest.fn(),
   metrics: jest.fn().mockResolvedValue("mock metrics"),
   contentType: "text/plain",
+  getMetricsAsArray: jest.fn().mockReturnValue([]),
 };
 
 const mockHistogram = {
@@ -143,10 +144,10 @@ describe("MetricsService", () => {
 
       expect(client.Gauge).toHaveBeenCalledWith({
         name: "reconciliation_drift_active",
-        help: "Whether the latest successful payment reconciliation found drift (1=active, 0=clear)",
+        help: "Whether the latest reconciliation run exceeded drift thresholds (1) or not (0)",
       });
 
-      expect(mockRegistry.registerMetric).toHaveBeenCalledTimes(15);
+      expect(mockRegistry.registerMetric).toHaveBeenCalledTimes(26);
     });
 
     it("should handle initialization errors gracefully", () => {
@@ -262,8 +263,8 @@ describe("MetricsService", () => {
         it("sets the active drift gauge to 1 and clears it to 0", () => {
           service.onModuleInit();
 
-          service.setReconciliationDriftActive(true);
-          service.setReconciliationDriftActive(false);
+          service.setReconciliationDriftActive(1);
+          service.setReconciliationDriftActive(0);
 
           expect(mockGauge.set).toHaveBeenNthCalledWith(1, 1);
           expect(mockGauge.set).toHaveBeenNthCalledWith(2, 0);

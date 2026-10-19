@@ -1,5 +1,9 @@
 import { Injectable, OnModuleInit } from "@nestjs/common";
 import * as client from "prom-client";
+import {
+  assertMetricLabelsBounded,
+  boundedMetricLabel,
+} from "./metric-label-guard";
 
 @Injectable()
 export class MetricsService implements OnModuleInit {
@@ -17,8 +21,19 @@ export class MetricsService implements OnModuleInit {
   private sorobanRpcActiveEndpoint: client.Gauge<string>;
   private sorobanIndexerUnknownSchemaVersion: client.Counter<string>;
   private parityCheckResults: client.Gauge<string>;
-  private reconciliationDriftActive: client.Gauge<string>;
   private shadowTrafficRequests: client.Counter<string>;
+  private indexerLagLedgers: client.Gauge<string>;
+  private indexerLagGuardBlockedRequests: client.Counter<string>;
+  private indexerLagGuardStatus: client.Gauge<string>;
+  private abuseSignalsTotal: client.Counter<string>;
+  private abuseSignalsHighScore: client.Counter<string>;
+  private abuseSignalsByOutcome: client.Counter<string>;
+  private abuseScoresHistogram: client.Histogram<string>;
+  private outboxDepth: client.Gauge<string>;
+  private outboxDispatchLagSeconds: client.Gauge<string>;
+  private outboxDispatchTotal: client.Counter<string>;
+  private reconciliationDriftActive: client.Gauge<string>;
+  private reconciliationConsecutiveFailures: client.Gauge<string>;
   private initialized = false;
 
   onModuleInit() {
@@ -107,15 +122,77 @@ export class MetricsService implements OnModuleInit {
         labelNames: ["status"],
       });
 
-      this.reconciliationDriftActive = new client.Gauge({
-        name: "reconciliation_drift_active",
-        help: "Whether the latest successful payment reconciliation found drift (1=active, 0=clear)",
-      });
-
       this.shadowTrafficRequests = new client.Counter({
         name: "shadow_traffic_requests_total",
         help: "Total number of shadow traffic requests",
         labelNames: ["method", "route", "status_code", "shadow_status"],
+      });
+
+      this.indexerLagLedgers = new client.Gauge({
+        name: "indexer_lag_ledgers",
+        help: "Current indexer lag in ledgers",
+      });
+
+      this.indexerLagGuardBlockedRequests = new client.Counter({
+        name: "indexer_lag_guard_blocked_requests_total",
+        help: "Total number of requests blocked by indexer lag guard",
+        labelNames: ["method", "route"],
+      });
+
+      this.indexerLagGuardStatus = new client.Gauge({
+        name: "indexer_lag_guard_status",
+        help: "Indexer lag guard status (0=disabled, 1=enabled, 2=overridden, 3=lagging)",
+      });
+
+      this.abuseSignalsTotal = new client.Counter({
+        name: "abuse_signals_total",
+        help: "Total number of abuse signals recorded",
+        labelNames: ["action_type", "action_outcome"],
+      });
+
+      this.abuseSignalsHighScore = new client.Counter({
+        name: "abuse_signals_high_score_total",
+        help: "Total number of high-score abuse signals (above threshold)",
+        labelNames: ["score_range", "top_tag"],
+      });
+
+      this.abuseSignalsByOutcome = new client.Counter({
+        name: "abuse_signals_by_outcome_total",
+        help: "Abuse signals broken down by outcome",
+        labelNames: ["outcome"],
+      });
+
+      this.abuseScoresHistogram = new client.Histogram({
+        name: "abuse_signal_score",
+        help: "Distribution of computed abuse scores",
+        labelNames: ["action_outcome"],
+        buckets: [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+      });
+
+      this.outboxDepth = new client.Gauge({
+        name: "outbox_depth",
+        help: "Number of domain events currently waiting in the outbox for dispatch",
+      });
+
+      this.outboxDispatchLagSeconds = new client.Gauge({
+        name: "outbox_dispatch_lag_seconds",
+        help: "Seconds the oldest undispatched outbox event has been waiting for delivery",
+      });
+
+      this.outboxDispatchTotal = new client.Counter({
+        name: "outbox_dispatch_total",
+        help: "Total outbox dispatch attempts by outcome",
+        labelNames: ["event_type", "outcome"],
+      });
+
+      this.reconciliationDriftActive = new client.Gauge({
+        name: "reconciliation_drift_active",
+        help: "Whether the latest reconciliation run exceeded drift thresholds (1) or not (0)",
+      });
+
+      this.reconciliationConsecutiveFailures = new client.Gauge({
+        name: "reconciliation_consecutive_failures",
+        help: "Number of consecutive failed or skipped reconciliation runs",
       });
 
       this.register.registerMetric(this.httpRequestDuration);
@@ -131,13 +208,42 @@ export class MetricsService implements OnModuleInit {
       this.register.registerMetric(this.sorobanRpcActiveEndpoint);
       this.register.registerMetric(this.sorobanIndexerUnknownSchemaVersion);
       this.register.registerMetric(this.parityCheckResults);
-      this.register.registerMetric(this.reconciliationDriftActive);
       this.register.registerMetric(this.shadowTrafficRequests);
+      this.register.registerMetric(this.indexerLagLedgers);
+      this.register.registerMetric(this.indexerLagGuardBlockedRequests);
+      this.register.registerMetric(this.indexerLagGuardStatus);
+      this.register.registerMetric(this.abuseSignalsTotal);
+      this.register.registerMetric(this.abuseSignalsHighScore);
+      this.register.registerMetric(this.abuseSignalsByOutcome);
+      this.register.registerMetric(this.abuseScoresHistogram);
+      this.register.registerMetric(this.outboxDepth);
+      this.register.registerMetric(this.outboxDispatchLagSeconds);
+      this.register.registerMetric(this.outboxDispatchTotal);
+      this.register.registerMetric(this.reconciliationDriftActive);
+      this.register.registerMetric(this.reconciliationConsecutiveFailures);
+
+      // BE-115: fail fast at boot if any registered metric uses a label source
+      // that is not covered by the bounded-label policy.
+      this.assertAllMetricLabelsBounded();
 
       this.initialized = true;
     } catch (error) {
       console.error("Failed to initialize metrics:", error);
       this.initialized = false;
+    }
+  }
+
+  /**
+   * BE-115: every label name registered on a metric must have a bounded
+   * policy (see metric-label-guard.ts). Throws when a new metric is added
+   * with an unbounded label source so the test suite catches it immediately.
+   */
+  private assertAllMetricLabelsBounded(): void {
+    for (const metric of this.register.getMetricsAsArray()) {
+      const labelNames = (metric as { labelNames?: readonly string[] }).labelNames;
+      if (labelNames) {
+        assertMetricLabelsBounded(labelNames);
+      }
     }
   }
 
@@ -208,7 +314,9 @@ export class MetricsService implements OnModuleInit {
     }
 
     try {
-      this.ingestionLagSeconds.labels(contractId).set(lagSeconds);
+      this.ingestionLagSeconds
+        .labels(boundedMetricLabel("contract_id", contractId))
+        .set(lagSeconds);
     } catch (error) {}
   }
 
@@ -266,7 +374,11 @@ export class MetricsService implements OnModuleInit {
     }
     try {
       this.sorobanRpcFailoverTotal
-        .labels(fromEndpoint, toEndpoint, reason)
+        .labels(
+          boundedMetricLabel("from_endpoint", fromEndpoint),
+          boundedMetricLabel("to_endpoint", toEndpoint),
+          boundedMetricLabel("reason", reason),
+        )
         .inc();
     } catch (error) {}
   }
@@ -277,7 +389,9 @@ export class MetricsService implements OnModuleInit {
     }
     try {
       for (const url of allEndpoints) {
-        this.sorobanRpcActiveEndpoint.labels(url).set(url === endpoint ? 1 : 0);
+        this.sorobanRpcActiveEndpoint
+          .labels(boundedMetricLabel("endpoint", url))
+          .set(url === endpoint ? 1 : 0);
       }
     } catch (error) {}
   }
@@ -286,7 +400,10 @@ export class MetricsService implements OnModuleInit {
     if (!this.initialized || !this.sorobanIndexerUnknownSchemaVersion) return;
     try {
       this.sorobanIndexerUnknownSchemaVersion
-        .labels(eventName, String(schemaVersion))
+        .labels(
+          boundedMetricLabel("event_name", eventName),
+          boundedMetricLabel("schema_version", String(schemaVersion)),
+        )
         .inc();
     } catch (error) {}
   }
@@ -305,13 +422,6 @@ export class MetricsService implements OnModuleInit {
     } catch (error) {}
   }
 
-  setReconciliationDriftActive(active: boolean) {
-    if (!this.initialized || !this.reconciliationDriftActive) return;
-    try {
-      this.reconciliationDriftActive.set(active ? 1 : 0);
-    } catch (error) {}
-  }
-
   recordShadowTrafficRequest(
     method: string,
     route: string,
@@ -323,6 +433,90 @@ export class MetricsService implements OnModuleInit {
       this.shadowTrafficRequests
         .labels(method, route, statusCode.toString(), shadowStatus)
         .inc();
+    } catch (error) {}
+  }
+
+  recordIndexerLag(lagLedgers: number) {
+    if (!this.initialized || !this.indexerLagLedgers) return;
+    try {
+      this.indexerLagLedgers.set(lagLedgers);
+    } catch (error) {}
+  }
+
+  recordIndexerLagGuardBlockedRequest(method: string, route: string) {
+    if (!this.initialized || !this.indexerLagGuardBlockedRequests) return;
+    try {
+      this.indexerLagGuardBlockedRequests.labels(method, route).inc();
+    } catch (error) {}
+  }
+
+  setIndexerLagGuardStatus(status: 0 | 1 | 2 | 3) {
+    if (!this.initialized || !this.indexerLagGuardStatus) return;
+    try {
+      this.indexerLagGuardStatus.set(status);
+    } catch (error) {}
+  }
+
+  recordAbuseSignal(
+    actionType: string,
+    actionOutcome: string,
+    score: number,
+    tags: string[],
+  ) {
+    if (!this.initialized) return;
+    try {
+      this.abuseSignalsTotal?.labels(actionType, actionOutcome).inc();
+      this.abuseSignalsByOutcome?.labels(actionOutcome).inc();
+      this.abuseScoresHistogram?.labels(actionOutcome).observe(score);
+
+      if (score >= 30) {
+        const scoreRange =
+          score >= 80 ? "80-100" : score >= 50 ? "50-79" : "30-49";
+        const topTag = tags[0] ?? "none";
+        this.abuseSignalsHighScore
+          ?.labels(scoreRange, boundedMetricLabel("top_tag", topTag))
+          .inc();
+      }
+    } catch (error) {}
+  }
+
+  setOutboxDepth(depth: number) {
+    if (!this.initialized || !this.outboxDepth) return;
+    try {
+      this.outboxDepth.set(depth);
+    } catch (error) {}
+  }
+
+  setOutboxDispatchLagSeconds(lagSeconds: number) {
+    if (!this.initialized || !this.outboxDispatchLagSeconds) return;
+    try {
+      this.outboxDispatchLagSeconds.set(lagSeconds);
+    } catch (error) {}
+  }
+
+  recordOutboxDispatch(
+    eventType: string,
+    outcome: "success" | "retry" | "dead",
+  ) {
+    if (!this.initialized || !this.outboxDispatchTotal) return;
+    try {
+      this.outboxDispatchTotal.labels(eventType, outcome).inc();
+    } catch (error) {}
+  }
+
+  /** Set whether the latest reconciliation run exceeded drift thresholds (BE-124). */
+  setReconciliationDriftActive(active: 0 | 1) {
+    if (!this.initialized || !this.reconciliationDriftActive) return;
+    try {
+      this.reconciliationDriftActive.set(active);
+    } catch (error) {}
+  }
+
+  /** Set the current consecutive failed/skipped reconciliation run count (BE-124). */
+  setReconciliationConsecutiveFailures(count: number) {
+    if (!this.initialized || !this.reconciliationConsecutiveFailures) return;
+    try {
+      this.reconciliationConsecutiveFailures.set(count);
     } catch (error) {}
   }
 }

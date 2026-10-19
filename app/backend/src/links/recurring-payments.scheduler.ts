@@ -7,6 +7,7 @@ import { RecurringPaymentProcessor } from '../stellar/recurring-payment-processo
 import { JobQueueService } from '../job-queue/job-queue.service';
 import { JobType } from '../job-queue/types';
 import { RecurringPaymentPayload } from '../job-queue/types/job-payloads.types';
+import { UsernamesService } from '../usernames/usernames.service';
 
 @Injectable()
 export class RecurringPaymentsScheduler implements OnModuleInit {
@@ -21,6 +22,7 @@ export class RecurringPaymentsScheduler implements OnModuleInit {
     private readonly paymentProcessor: RecurringPaymentProcessor,
     private readonly eventEmitter: EventEmitter2,
     private readonly jobQueueService: JobQueueService,
+    private readonly usernamesService: UsernamesService,
   ) {
     this.maxRetries = parseInt(process.env.RECURRING_PAYMENT_MAX_RETRY || '3');
     this.retryBackoffMs = parseInt(process.env.RECURRING_PAYMENT_RETRY_BACKOFF_MS || '60000');
@@ -71,13 +73,63 @@ export class RecurringPaymentsScheduler implements OnModuleInit {
     try {
       this.logger.debug('Checking for upcoming payment notifications...');
 
-      // This would query for payments scheduled in the next 24 hours
-      // Implementation depends on specific notification requirements
-      // For now, we'll skip detailed implementation
+      const upcomingLinks = await this.schedulerService.getUpcomingLinksForNotification(
+        this.notificationHoursBefore,
+      );
+
+      if (upcomingLinks.length === 0) {
+        this.logger.debug('No upcoming recurring payments due for notification');
+        return;
+      }
+
+      this.logger.log(`Found ${upcomingLinks.length} upcoming recurring payment(s) for notification check`);
+
+      for (const link of upcomingLinks) {
+        try {
+          await this.processUpcomingNotification(link);
+        } catch (error: unknown) {
+          const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+          this.logger.error(
+            `Error processing upcoming notification for link ${link.id}: ${errorMessage}`,
+            error instanceof Error ? error.stack : undefined,
+          );
+        }
+      }
     } catch (error: unknown) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       this.logger.error(`Error sending notifications: ${errorMessage}`, error instanceof Error ? error.stack : undefined);
     }
+  }
+
+  private async processUpcomingNotification(link: DbRecurringPaymentLink): Promise<void> {
+    const nextPeriodNumber = link.executed_count + 1;
+
+    let execution = await this.repository.findExecutionByLinkAndPeriod(link.id, nextPeriodNumber);
+
+    if (!execution) {
+      execution = await this.repository.createExecution({
+        recurringLinkId: link.id,
+        periodNumber: nextPeriodNumber,
+        scheduledAt: new Date(link.next_execution_date),
+        amount: link.amount,
+        asset: link.asset,
+        previewScope: link.preview_scope || undefined,
+      });
+    }
+
+    if (execution.notification_sent) {
+      this.logger.debug(
+        `Upcoming payment notification already sent for link ${link.id} execution ${execution.id}`,
+      );
+      return;
+    }
+
+    await this.notifyUser(link, execution, 'due');
+    await this.repository.markNotificationSent(execution.id);
+
+    this.logger.log(
+      `Sent upcoming payment notification for link ${link.id} execution ${execution.id}`,
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -93,16 +145,21 @@ export class RecurringPaymentsScheduler implements OnModuleInit {
       // Determine the next period number
       const nextPeriodNumber = link.executed_count + 1;
 
-      // Create execution record
-      const execution = await this.repository.createExecution({
-        recurringLinkId: linkId,
-        periodNumber: nextPeriodNumber,
-        scheduledAt: new Date(link.next_execution_date),
-        amount: link.amount,
-        asset: link.asset,
-      });
+      // Get or create execution record
+      let execution = await this.repository.findExecutionByLinkAndPeriod(linkId, nextPeriodNumber);
 
-      this.logger.log(`Created execution record: ${execution.id} for period ${nextPeriodNumber}`);
+      if (!execution) {
+        execution = await this.repository.createExecution({
+          recurringLinkId: linkId,
+          periodNumber: nextPeriodNumber,
+          scheduledAt: new Date(link.next_execution_date),
+          amount: link.amount,
+          asset: link.asset,
+        });
+        this.logger.log(`Created execution record: ${execution.id} for period ${nextPeriodNumber}`);
+      } else {
+        this.logger.log(`Using existing execution record: ${execution.id} for period ${nextPeriodNumber}`);
+      }
 
       // Execute the payment
       await this.executeSinglePayment(link, execution);
@@ -132,7 +189,21 @@ export class RecurringPaymentsScheduler implements OnModuleInit {
       const recipientAddress = link.destination || (await this.resolveUsernameToAddress(link.username!));
 
       if (!recipientAddress) {
-        throw new Error('Could not resolve recipient address');
+        this.logger.warn(`Could not resolve recipient for link ${link.id} (username: ${link.username})`);
+
+        await this.schedulerService.pauseRecurringLink(link.id);
+
+        await this.notifyUser(link, execution, 'failed', undefined, `Username unresolvable or unclaimed: ${link.username}`);
+
+        this.eventEmitter.emit('recurring.payment.failed', {
+          executionId,
+          linkId: link.id,
+          failureReason: `Username unresolvable or unclaimed: ${link.username}`,
+          retryCount: execution.retry_count,
+          permanent: true,
+        });
+
+        return;
       }
 
       // Enqueue payment job via JobQueueService
@@ -212,6 +283,7 @@ export class RecurringPaymentsScheduler implements OnModuleInit {
         periodNumber: execution.period_number,
         transactionHash,
         failureReason,
+        scheduledAt: execution.scheduled_at,
       });
 
       this.logger.debug(`Emitted notification event: ${eventType}`);
@@ -221,11 +293,19 @@ export class RecurringPaymentsScheduler implements OnModuleInit {
     }
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  private async resolveUsernameToAddress(_username: string): Promise<string | null> {
-    // TODO: Integrate with usernames module to resolve username to Stellar address
-    // For now, return null - in production this would query the usernames table
-    this.logger.warn('Username resolution not yet implemented');
-    return null;
+  private async resolveUsernameToAddress(username: string): Promise<string | null> {
+    try {
+      const profile = await this.usernamesService.getPublicProfile(username);
+      if (profile) {
+        this.logger.log(`Resolved username ${username} to address ${profile.public_key}`);
+        return profile.public_key;
+      }
+      this.logger.warn(`Username not found: ${username}`);
+      return null;
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      this.logger.error(`Error resolving username ${username}: ${errorMessage}`, error instanceof Error ? error.stack : undefined);
+      return null;
+    }
   }
 }

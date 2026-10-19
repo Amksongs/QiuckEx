@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Activity, DatabaseZap, ShieldAlert } from "lucide-react";
 
 import { getQuickexApiBase } from "@/lib/api";
+import { getAdminCredentialClient } from "@/lib/admin-auth";
 
 type HealthResponse = {
   status: string;
@@ -27,9 +28,15 @@ export function SystemHealth() {
 
     const load = async () => {
       try {
+        const credential = getAdminCredentialClient();
         const [healthResponse, flagsResponse] = await Promise.all([
           fetch(`${apiBase}/health`, { cache: "no-store" }),
-          fetch(`${apiBase}/admin/feature-flags`, { cache: "no-store" }),
+          fetch(`${apiBase}/admin/feature-flags`, {
+            cache: "no-store",
+            headers: {
+              ...(credential ? { "x-api-key": credential } : {}),
+            },
+          }),
         ]);
 
         if (!healthResponse.ok) {
@@ -61,32 +68,32 @@ export function SystemHealth() {
   }, [apiBase]);
 
   return (
-    <div className="bg-white p-6 rounded-lg shadow-sm border border-gray-200">
-      <h2 className="text-lg font-semibold text-gray-800 mb-4">System Health</h2>
+    <div className="bg-card p-6 rounded-lg shadow-sm border border-border">
+      <h2 className="text-lg font-semibold text-foreground mb-4">System Health</h2>
 
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        <div className="p-4 bg-green-50 rounded-lg border border-green-100">
-          <div className="flex items-center space-x-2 text-green-600 mb-2">
+        <div className="p-4 bg-success-soft rounded-lg border border-success-soft">
+          <div className="flex items-center space-x-2 text-success mb-2">
             <Activity className="h-5 w-5" />
             <span className="font-medium">API Status</span>
           </div>
-          <p className="text-2xl font-bold text-gray-800">{apiStatus}</p>
+          <p className="text-2xl font-bold text-foreground">{apiStatus}</p>
         </div>
 
-        <div className="p-4 bg-blue-50 rounded-lg border border-blue-100">
-          <div className="flex items-center space-x-2 text-blue-600 mb-2">
+        <div className="p-4 bg-brand-soft rounded-lg border border-brand-soft">
+          <div className="flex items-center space-x-2 text-brand mb-2">
             <DatabaseZap className="h-5 w-5" />
             <span className="font-medium">Flag Store</span>
           </div>
-          <p className="text-2xl font-bold text-gray-800">{flagStore}</p>
+          <p className="text-2xl font-bold text-foreground">{flagStore}</p>
         </div>
 
-        <div className="p-4 bg-amber-50 rounded-lg border border-amber-100">
-          <div className="flex items-center space-x-2 text-amber-600 mb-2">
+        <div className="p-4 bg-warning-soft rounded-lg border border-warning-soft">
+          <div className="flex items-center space-x-2 text-warning mb-2">
             <ShieldAlert className="h-5 w-5" />
             <span className="font-medium">Uptime</span>
           </div>
-          <p className="text-2xl font-bold text-gray-800">{uptime}</p>
+          <p className="text-2xl font-bold text-foreground">{uptime}</p>
         </div>
       </div>
     </div>

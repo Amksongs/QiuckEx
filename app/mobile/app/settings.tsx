@@ -1,5 +1,7 @@
 import { Link, useRouter } from "expo-router";
 import React from "react";
+import { BuildMetadataPanel } from "../components/BuildMetadataPanel";
+import { EnvironmentSwitcher } from "../components/EnvironmentSwitcher";
 import {
   Alert,
   Platform,
@@ -25,17 +27,14 @@ import {
 import { useTheme } from "../src/theme/ThemeContext";
 import {
   APP_ENVIRONMENT,
-  APP_VERSION,
-  BUILD_METADATA,
-  BUILD_TAG,
-  STELLAR_NETWORK,
+  IS_DEBUG_BUILD,
 } from "../src/config/build";
 
-const FREQUENCY_OPTIONS: Array<{
+const FREQUENCY_OPTIONS: {
   value: SyncFrequency;
   label: string;
   helper: string;
-}> = [
+}[] = [
   {
     value: "battery-saver",
     label: "Battery Saver",
@@ -107,7 +106,7 @@ export default function SettingsScreen() {
         contentContainerStyle={styles.content}
         showsVerticalScrollIndicator={false}
       >
-        <Text style={[styles.title, { color: theme.textPrimary }]}>
+        <Text style={[styles.title, { color: theme.textPrimary }]} accessibilityRole="header">
           Settings
         </Text>
 
@@ -120,13 +119,18 @@ export default function SettingsScreen() {
             { backgroundColor: theme.surface, borderColor: theme.border },
           ]}
         >
-          <Text style={[styles.cardTitle, { color: theme.textPrimary }]}>
+          <Text style={[styles.cardTitle, { color: theme.textPrimary }]} accessibilityRole="header">
             Security
           </Text>
 
           <Link href="/security-center" asChild>
-            <Pressable style={styles.row}>
-              <View style={styles.rowCopy}>
+            <Pressable
+              style={styles.row}
+              accessibilityLabel="Security Center. Review your security posture and settings."
+              accessibilityRole="link"
+              accessibilityHint="Double-tap to navigate to the Security Center page"
+            >
+              <View style={styles.rowCopy} accessibilityElementsHidden={true} importantForAccessibility="no">
                 <Text style={[styles.label, { color: theme.textPrimary }]}>
                   Security Center
                 </Text>
@@ -134,7 +138,7 @@ export default function SettingsScreen() {
                   Review your security posture and settings.
                 </Text>
               </View>
-              <Text style={[styles.helper, { color: theme.textMuted }]}>→</Text>
+              <Text style={[styles.helper, { color: theme.textMuted }]} accessibilityElementsHidden={true} importantForAccessibility="no">→</Text>
             </Pressable>
           </Link>
         </View>
@@ -145,12 +149,16 @@ export default function SettingsScreen() {
             { backgroundColor: theme.surface, borderColor: theme.border },
           ]}
         >
-          <Text style={[styles.cardTitle, { color: theme.textPrimary }]}>
+          <Text style={[styles.cardTitle, { color: theme.textPrimary }]} accessibilityRole="header">
             Notifications
           </Text>
 
-          <View style={styles.row}>
-            <View style={styles.rowCopy}>
+          <View
+            style={styles.row}
+            accessibilityLabel={`Sound Effects. ${soundEnabled ? 'Enabled' : 'Disabled'}. Play a short tone when a new synced notification appears.`}
+            accessibilityRole="none"
+          >
+            <View style={styles.rowCopy} accessibilityElementsHidden={true} importantForAccessibility="no">
               <Text style={[styles.label, { color: theme.textPrimary }]}>
                 Sound Effects
               </Text>
@@ -158,11 +166,21 @@ export default function SettingsScreen() {
                 Play a short tone when a new synced notification appears.
               </Text>
             </View>
-            <Switch value={soundEnabled} onValueChange={setSoundEnabled} />
+            <Switch
+              value={soundEnabled}
+              onValueChange={setSoundEnabled}
+              accessibilityLabel={`Sound Effects toggle, currently ${soundEnabled ? 'on' : 'off'}`}
+              accessibilityRole="switch"
+              accessibilityState={{ checked: soundEnabled }}
+            />
           </View>
 
-          <View style={styles.row}>
-            <View style={styles.rowCopy}>
+          <View
+            style={styles.row}
+            accessibilityLabel={`App Badge. ${backgroundSyncSettings.badgeEnabled ? 'Enabled' : 'Disabled'}. Keep the launcher badge aligned with unread notifications.`}
+            accessibilityRole="none"
+          >
+            <View style={styles.rowCopy} accessibilityElementsHidden={true} importantForAccessibility="no">
               <Text style={[styles.label, { color: theme.textPrimary }]}>
                 App Badge
               </Text>
@@ -178,6 +196,9 @@ export default function SettingsScreen() {
                   badgeEnabled: value,
                 }));
               }}
+              accessibilityLabel={`App Badge toggle, currently ${backgroundSyncSettings.badgeEnabled ? 'on' : 'off'}`}
+              accessibilityRole="switch"
+              accessibilityState={{ checked: backgroundSyncSettings.badgeEnabled }}
             />
           </View>
         </View>
@@ -188,20 +209,24 @@ export default function SettingsScreen() {
             { backgroundColor: theme.surface, borderColor: theme.border },
           ]}
         >
-          <Text style={[styles.cardTitle, { color: theme.textPrimary }]}>
+          <Text style={[styles.cardTitle, { color: theme.textPrimary }]} accessibilityRole="header">
             Background Sync
           </Text>
-          <Text style={[styles.helper, { color: theme.textMuted }]}>
+          <Text style={[styles.helper, { color: theme.textMuted }]}> 
             Uses Expo background tasks when available and falls back to
             foreground refreshes when periodic work is unavailable.
           </Text>
 
-          <View style={styles.row}>
-            <View style={styles.rowCopy}>
-              <Text style={[styles.label, { color: theme.textPrimary }]}>
+          <View
+            style={styles.row}
+            accessibilityLabel={`Periodic Sync. ${backgroundSyncSettings.enabled ? 'Enabled' : 'Disabled'}. Refresh notifications and recent activity without opening the app.`}
+            accessibilityRole="none"
+          >
+            <View style={styles.rowCopy} accessibilityElementsHidden={true} importantForAccessibility="no">
+              <Text style={[styles.label, { color: theme.textPrimary }]}> 
                 Periodic Sync
               </Text>
-              <Text style={[styles.helper, { color: theme.textMuted }]}>
+              <Text style={[styles.helper, { color: theme.textMuted }]}> 
                 Refresh notifications and recent activity without opening the
                 app.
               </Text>
@@ -214,15 +239,22 @@ export default function SettingsScreen() {
                   enabled: value,
                 }));
               }}
+              accessibilityLabel={`Periodic Sync toggle, currently ${backgroundSyncSettings.enabled ? 'on' : 'off'}`}
+              accessibilityRole="switch"
+              accessibilityState={{ checked: backgroundSyncSettings.enabled }}
             />
           </View>
 
-          <View style={styles.row}>
-            <View style={styles.rowCopy}>
-              <Text style={[styles.label, { color: theme.textPrimary }]}>
+          <View
+            style={styles.row}
+            accessibilityLabel={`Wi-Fi Only. ${backgroundSyncSettings.wifiOnly ? 'Enabled' : 'Disabled'}. Skip background work on mobile data for better battery life.`}
+            accessibilityRole="none"
+          >
+            <View style={styles.rowCopy} accessibilityElementsHidden={true} importantForAccessibility="no">
+              <Text style={[styles.label, { color: theme.textPrimary }]}> 
                 Wi-Fi Only
               </Text>
-              <Text style={[styles.helper, { color: theme.textMuted }]}>
+              <Text style={[styles.helper, { color: theme.textMuted }]}> 
                 Skip background work on mobile data for better battery life.
               </Text>
             </View>
@@ -234,10 +266,13 @@ export default function SettingsScreen() {
                   wifiOnly: value,
                 }));
               }}
+              accessibilityLabel={`Wi-Fi Only toggle, currently ${backgroundSyncSettings.wifiOnly ? 'on' : 'off'}`}
+              accessibilityRole="switch"
+              accessibilityState={{ checked: backgroundSyncSettings.wifiOnly }}
             />
           </View>
 
-          <Text style={[styles.subheading, { color: theme.textPrimary }]}>
+          <Text style={[styles.subheading, { color: theme.textPrimary }]} accessibilityRole="header">
             Sync Frequency
           </Text>
           <View style={styles.optionGroup}>
@@ -263,6 +298,10 @@ export default function SettingsScreen() {
                       frequency: option.value,
                     }));
                   }}
+                  accessibilityLabel={`Sync frequency: ${option.label}. ${option.helper}. ${active ? 'Currently selected' : 'Not selected'}.`}
+                  accessibilityRole="radio"
+                  accessibilityState={{ selected: active }}
+                  accessibilityHint={`Double-tap to set sync frequency to ${option.label}`}
                 >
                   <Text
                     style={[
@@ -273,11 +312,15 @@ export default function SettingsScreen() {
                           : theme.textPrimary,
                       },
                     ]}
+                    accessibilityElementsHidden={true}
+                    importantForAccessibility="no"
                   >
                     {option.label}
                   </Text>
                   <Text
                     style={[styles.optionHelper, { color: theme.textMuted }]}
+                    accessibilityElementsHidden={true}
+                    importantForAccessibility="no"
                   >
                     {option.helper}
                   </Text>
@@ -294,13 +337,30 @@ export default function SettingsScreen() {
                 borderColor: theme.borderLight,
               },
             ]}
+            accessibilityLabel={`${backgroundTaskAvailable
+              ? "Native background scheduling is available on this build."
+              : "This build will fall back to foreground refreshes if native background scheduling is unavailable."
+            }. ${isSyncing
+              ? "Syncing now."
+              : lastSyncedAt
+                ? `Last successful sync: ${new Date(lastSyncedAt).toLocaleString()}.`
+                : "No successful sync recorded yet."
+            }`}
           >
-            <Text style={[styles.statusText, { color: theme.textPrimary }]}>
+            <Text
+              style={[styles.statusText, { color: theme.textPrimary }]}
+              accessibilityElementsHidden={true}
+              importantForAccessibility="no"
+            >
               {backgroundTaskAvailable
                 ? "Native background scheduling is available on this build."
                 : "This build will fall back to foreground refreshes if native background scheduling is unavailable."}
             </Text>
-            <Text style={[styles.statusSubtext, { color: theme.textMuted }]}>
+            <Text
+              style={[styles.statusSubtext, { color: theme.textMuted }]}
+              accessibilityElementsHidden={true}
+              importantForAccessibility="no"
+            >
               {isSyncing
                 ? "Syncing now..."
                 : lastSyncedAt
@@ -315,12 +375,18 @@ export default function SettingsScreen() {
               onPress={() => {
                 void syncNow();
               }}
+              disabled={isSyncing}
+              accessibilityLabel={`Force a background sync now. ${isSyncing ? 'Sync in progress, button disabled.' : 'Tap to start sync.'}`}
+              accessibilityRole="button"
+              accessibilityState={{ disabled: isSyncing }}
             >
               <Text
                 style={[
                   styles.syncNowButtonText,
                   { color: theme.buttonPrimaryText },
                 ]}
+                accessibilityElementsHidden={true}
+                importantForAccessibility="no"
               >
                 Sync Now
               </Text>
@@ -328,68 +394,48 @@ export default function SettingsScreen() {
           </View>
         </View>
 
+        <BuildMetadataPanel />
+
         <View
           style={[
             styles.card,
             { backgroundColor: theme.surface, borderColor: theme.border },
           ]}
         >
-          <Text style={[styles.cardTitle, { color: theme.textPrimary }]}>Build Info</Text>
+          <Text style={[styles.cardTitle, { color: theme.textPrimary }]} accessibilityRole="header">
+            Feedback
+          </Text>
 
-          <View style={styles.row}>
-            <Text style={[styles.label, { color: theme.textPrimary }]}>Version</Text>
-            <Text style={[styles.helper, { color: theme.textMuted }]}> 
-              {APP_VERSION}
-            </Text>
-          </View>
-
-          <View style={styles.row}>
-            <Text style={[styles.label, { color: theme.textPrimary }]}>Build</Text>
-            <Text style={[styles.helper, { color: theme.textMuted }]}> 
-              {BUILD_METADATA}
-            </Text>
-          </View>
-
-          <View style={styles.row}>
-            <Text style={[styles.label, { color: theme.textPrimary }]}>Environment</Text>
-            <View style={styles.envBadgeRow}>
-              {APP_ENVIRONMENT === 'staging' ? (
-                <View style={[styles.envBadge, { backgroundColor: '#F3E8FF', borderColor: '#A855F7' }]}>
-                  <Text style={[styles.envBadgeText, { color: '#6B21A8' }]}>STAGING</Text>
-                </View>
-              ) : null}
-              <Text style={[styles.helper, { color: theme.textMuted }]}> 
-                {APP_ENVIRONMENT}
-              </Text>
-            </View>
-          </View>
-
-          <View style={styles.row}>
-            <Text style={[styles.label, { color: theme.textPrimary }]}>Network</Text>
-            <Text style={[styles.helper, { color: theme.textMuted }]}> 
-              {STELLAR_NETWORK}
-            </Text>
-          </View>
-
-          {BUILD_TAG ? (
-            <View style={styles.row}>
-              <Text style={[styles.label, { color: theme.textPrimary }]}>Tag</Text>
-              <Text style={[styles.helper, { color: theme.textMuted }]}> 
-                {BUILD_TAG}
-              </Text>
-            </View>
-          ) : null}
+          <Link href="/feedback" asChild>
+            <Pressable
+              style={styles.row}
+              accessibilityLabel="Send Feedback. Report an issue or idea. Build and environment details are attached automatically."
+              accessibilityRole="link"
+              accessibilityHint="Double-tap to navigate to the feedback form"
+            >
+              <View style={styles.rowCopy} accessibilityElementsHidden={true} importantForAccessibility="no">
+                <Text style={[styles.label, { color: theme.textPrimary }]}> 
+                  Send Feedback
+                </Text>
+                <Text style={[styles.helper, { color: theme.textMuted }]}> 
+                  Report an issue or idea. Build and environment details are
+                  attached automatically.
+                </Text>
+              </View>
+              <Text style={[styles.helper, { color: theme.textMuted }]} accessibilityElementsHidden={true} importantForAccessibility="no">→</Text>
+            </Pressable>
+          </Link>
         </View>
 
         <View style={styles.section}>
-          <Text style={[styles.sectionTitle, { color: theme.textPrimary }]}> 
+          <Text style={[styles.sectionTitle, { color: theme.textPrimary }]} accessibilityRole="header">
             Onboarding
           </Text>
           <OnboardingResetButton />
         </View>
 
         <View style={styles.section}>
-          <Text style={[styles.sectionTitle, { color: theme.textPrimary }]}>Privacy & Data</Text>
+          <Text style={[styles.sectionTitle, { color: theme.textPrimary }]} accessibilityRole="header">Privacy & Data</Text>
           <Pressable
             style={[
               styles.clearDataButton,
@@ -399,15 +445,24 @@ export default function SettingsScreen() {
               },
             ]}
             onPress={handleClearLocalData}
+            accessibilityLabel="Clear Local Data. Destructive action. Removes cached app data, signs you out, and clears secure storage. Cannot be undone."
+            accessibilityRole="button"
+            accessibilityHint="Double-tap to open confirmation dialog for clearing all local data"
           >
-            <Text style={[styles.clearDataText, { color: theme.status.error }]}>Clear Local Data</Text>
+            <Text
+              style={[styles.clearDataText, { color: theme.status.error }]}
+              accessibilityElementsHidden={true}
+              importantForAccessibility="no"
+            >Clear Local Data</Text>
           </Pressable>
           <Text style={[styles.helper, { color: theme.textMuted }]}>Remove all cached and secure data, sign out, and reset the app state.</Text>
         </View>
 
-        {Platform.OS !== "web" ? (
+        <EnvironmentSwitcher />
+
+        {Platform.OS !== "web" && IS_DEBUG_BUILD ? (
           <View style={styles.section}>
-            <Text style={[styles.sectionTitle, { color: theme.textPrimary }]}>
+            <Text style={[styles.sectionTitle, { color: theme.textPrimary }]} accessibilityRole="header">
               Debug
             </Text>
             <Link href="/notification-debug" asChild>
@@ -416,9 +471,13 @@ export default function SettingsScreen() {
                   styles.debugButton,
                   { backgroundColor: theme.surface, borderColor: theme.border },
                 ]}
+                accessibilityLabel="Open Notification Simulator. Debug page to test notification rendering and delivery."
+                accessibilityRole="link"
               >
                 <Text
                   style={[styles.debugButtonText, { color: theme.textPrimary }]}
+                  accessibilityElementsHidden={true}
+                  importantForAccessibility="no"
                 >
                   Open Notification Simulator
                 </Text>
@@ -430,14 +489,38 @@ export default function SettingsScreen() {
                   styles.debugButton,
                   { backgroundColor: theme.surface, borderColor: theme.border },
                 ]}
+                accessibilityLabel="QA Smoke Checklist. Verification checklist for validating app features."
+                accessibilityRole="link"
               >
                 <Text
                   style={[styles.debugButtonText, { color: theme.textPrimary }]}
+                  accessibilityElementsHidden={true}
+                  importantForAccessibility="no"
                 >
                   QA Smoke Checklist
                 </Text>
               </Pressable>
             </Link>
+            {APP_ENVIRONMENT !== "production" && (
+              <Link href="/offline-queue-inspector" asChild>
+                <Pressable
+                  style={[
+                    styles.debugButton,
+                    { backgroundColor: theme.surface, borderColor: theme.border },
+                  ]}
+                  accessibilityLabel="Offline Queue Inspector. Debug page to view pending offline operations."
+                  accessibilityRole="link"
+                >
+                  <Text
+                    style={[styles.debugButtonText, { color: theme.textPrimary }]}
+                    accessibilityElementsHidden={true}
+                    importantForAccessibility="no"
+                  >
+                    Offline Queue Inspector
+                  </Text>
+                </Pressable>
+              </Link>
+            )}
           </View>
         ) : null}
       </ScrollView>
@@ -468,6 +551,7 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     alignItems: "center",
     gap: 12,
+    minHeight: 48,
   },
   rowCopy: {
     flex: 1,
@@ -546,25 +630,11 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     paddingVertical: 12,
     paddingHorizontal: 14,
+    minHeight: 48,
+    justifyContent: "center",
   },
   debugButtonText: {
     fontSize: 14,
     fontWeight: "600",
-  },
-  envBadgeRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-  },
-  envBadge: {
-    borderWidth: 1,
-    borderRadius: 6,
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-  },
-  envBadgeText: {
-    fontSize: 11,
-    fontWeight: "800",
-    letterSpacing: 0.5,
   },
 });

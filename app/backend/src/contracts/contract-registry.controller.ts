@@ -4,7 +4,9 @@ import {
   Get,
   HttpCode,
   HttpStatus,
+  Param,
   Post,
+  Put,
   Req,
   Res,
   UseGuards,
@@ -14,13 +16,16 @@ import { Request, Response } from 'express';
 
 import { ApiKeyGuard } from '../auth/guards/api-key.guard';
 import { RequireScopes } from '../auth/decorators/require-scopes.decorator';
-import { RateLimitGroupTag } from '../auth/decorators/rate-limit-group.decorator';
+import { RateLimitGroupTag, RateLimitTier } from '../auth/decorators/rate-limit-group.decorator';
 import { ContractRegistryService } from './contract-registry.service';
 import {
+  ContractDeploymentItemDto,
+  ContractDeploymentsResponseDto,
   ContractRegistryResponseDto,
   PublishContractRegistryDto,
   RollbackContractRegistryDto,
-} from './dto/contract-registry.dto';
+  UpsertContractDeploymentDto,
+} from './dto';
 
 @ApiTags('contracts')
 @ApiHeader({
@@ -30,11 +35,36 @@ import {
 })
 @RateLimitGroupTag('public')
 @UseGuards(ApiKeyGuard)
-@Controller('contracts')
+// `contracts` is the canonical prefix. The three aliases below are frozen
+// compatibility shims for clients already shipped against them — see
+// docs/ROUTING-CONVENTIONS.md. Do not add further aliases.
+@Controller(['contracts', 'api/contracts', 'mobile/contracts', 'api/mobile/contracts'])
 export class ContractRegistryController {
   constructor(private readonly contractRegistryService: ContractRegistryService) {}
 
+  @Get('registry/deployments')
+  @RateLimitTier('public-read')
+  @ApiOperation({
+    summary: 'List active contract deployments for the current network',
+  })
+  @ApiResponse({ status: 200, type: ContractDeploymentsResponseDto })
+  getDeployments() {
+    return this.contractRegistryService.getDeployments();
+  }
+
+  @Get('registry/deployments/:name')
+  @RateLimitTier('public-read')
+  @ApiOperation({
+    summary: 'Get active deployment metadata for a contract name',
+  })
+  @ApiResponse({ status: 200, type: ContractDeploymentItemDto })
+  @ApiResponse({ status: 404, description: 'Deployment entry not found for contract name' })
+  getDeploymentByName(@Param('name') name: string) {
+    return this.contractRegistryService.getDeploymentByName(name);
+  }
+
   @Get('registry')
+  @RateLimitTier('public-read')
   @ApiOperation({
     summary: 'Fetch the authoritative contract registry for the active network',
     description:
@@ -57,24 +87,52 @@ export class ContractRegistryController {
   }
 
   @Post('registry/publish')
+  @RateLimitTier('mutation')
   @HttpCode(HttpStatus.OK)
   @RequireScopes('admin')
   @RateLimitGroupTag('authenticated')
   @ApiOperation({
     summary: 'Publish deployment artifacts into the contract registry',
   })
-  publish(@Body() body: PublishContractRegistryDto) {
-    return this.contractRegistryService.publish(body, 'api');
+  publish(@Body() body: PublishContractRegistryDto, @Req() req: Request) {
+    const actor = req.apiKey?.id ?? 'api';
+    return this.contractRegistryService.publish(body, actor);
+  }
+
+  @Put('registry/deployments/:name')
+  @RateLimitTier('mutation')
+  @HttpCode(HttpStatus.OK)
+  @RequireScopes('admin')
+  @RateLimitGroupTag('authenticated')
+  @ApiOperation({
+    summary: 'Upsert deployment metadata for one contract (admin only)',
+  })
+  @ApiResponse({ status: 200, type: ContractDeploymentItemDto })
+  upsertDeployment(
+    @Param('name') name: string,
+    @Body() body: UpsertContractDeploymentDto,
+    @Req() req: Request,
+  ) {
+    const actor = req.apiKey?.id ?? 'api';
+    return this.contractRegistryService.upsertDeployment(
+      {
+        ...body,
+        name,
+      },
+      actor,
+    );
   }
 
   @Post('registry/rollback')
+  @RateLimitTier('mutation')
   @HttpCode(HttpStatus.OK)
   @RequireScopes('admin')
   @RateLimitGroupTag('authenticated')
   @ApiOperation({
     summary: 'Rollback the active registry entry for a contract to a previous version',
   })
-  rollback(@Body() body: RollbackContractRegistryDto) {
-    return this.contractRegistryService.rollback(body, 'api');
+  rollback(@Body() body: RollbackContractRegistryDto, @Req() req: Request) {
+    const actor = req.apiKey?.id ?? 'api';
+    return this.contractRegistryService.rollback(body, actor);
   }
 }

@@ -7,6 +7,7 @@ import { createHash } from "crypto";
 import { HealthService } from "./health.service";
 import { HealthResponseDto, ReadyResponseDto } from "./health-response.dto";
 import { PublicStatusResponseDto } from "./public-status.dto";
+import { RateLimitTier } from "../auth/decorators/rate-limit-group.decorator";
 
 @ApiTags("health")
 @Controller()
@@ -14,6 +15,7 @@ export class HealthController {
   constructor(private readonly healthService: HealthService) {}
 
   @Get("health")
+  @RateLimitTier("public-read")
   @ApiOperation({
     summary: "Health check",
     description:
@@ -26,10 +28,11 @@ export class HealthController {
   }
 
   @Get("ready")
+  @RateLimitTier("public-read")
   @ApiOperation({
     summary: "Readiness check",
     description:
-      "Returns application readiness status including dependency checks (Supabase, environment). Used for readiness probes.",
+      "Returns readiness status including dependency checks (database, Horizon, Soroban RPC) with per-check timeouts. Used for readiness probes. Returns 503 when a critical dependency has hard-failed.",
   })
   @ApiResponse({ status: 200, type: ReadyResponseDto })
   @ApiResponse({
@@ -48,6 +51,7 @@ export class HealthController {
   }
 
   @Get("status")
+  @RateLimitTier("public-read")
   @Throttle({ default: { limit: 5, ttl: 60000 } }) // 5 requests per minute for public status
   @ApiOperation({
     summary: "Public status page",

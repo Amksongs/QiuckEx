@@ -16,6 +16,8 @@ export type SorobanEventType =
 
 export interface BaseContractEvent {
   eventType: SorobanEventType;
+  /** Deterministic SHA-256 hex id computed from the event's identity fields. */
+  eventId: string;
   /** Schema version read from the event payload (1 = legacy, 2+ = versioned). */
   schemaVersion: number;
   topicNamespace?: string;
@@ -33,6 +35,11 @@ export interface EscrowDepositedEvent extends BaseContractEvent {
   amount: bigint;
   amountPaid?: bigint;
   expiresAt: bigint;
+  /**
+   * Deterministic on-chain receipt reference (32-byte hex digest) emitted by
+   * the contract since schema v3. Null for v1/v2 events.
+   */
+  receiptReference?: string | null;
 }
 
 export interface EscrowWithdrawnEvent extends BaseContractEvent {
@@ -41,6 +48,11 @@ export interface EscrowWithdrawnEvent extends BaseContractEvent {
   owner: string;
   token: string;
   amount: bigint;
+  /**
+   * Deterministic on-chain receipt reference (32-byte hex digest) emitted by
+   * the contract since schema v3. Null for v1/v2 events.
+   */
+  receiptReference?: string | null;
 }
 
 export interface EscrowRefundedEvent extends BaseContractEvent {
@@ -49,6 +61,11 @@ export interface EscrowRefundedEvent extends BaseContractEvent {
   owner: string;
   token: string;
   amount: bigint;
+  /**
+   * Deterministic on-chain receipt reference (32-byte hex digest) emitted by
+   * the contract since schema v3. Null for v1/v2 events.
+   */
+  receiptReference?: string | null;
 }
 
 export interface PrivacyToggledEvent extends BaseContractEvent {

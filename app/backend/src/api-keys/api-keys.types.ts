@@ -4,7 +4,11 @@ export const API_KEY_SCOPES = [
   'transactions:read',
   'usernames:read',
   'refunds:write',
+  'support:read',
+  'support:write',
   'admin', // Admin scope for job queue management and other admin operations
+  'branch_preview:owner',
+  'branch_preview:reviewer',
 ] as const;
 
 export type ApiKeyScope = (typeof API_KEY_SCOPES)[number];

@@ -1,0 +1,238 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { RedactionService } from './redaction.service';
+import { CrashReportingRepository } from './crash-reporting.repository';
+import { CrashReport, LogExport, CrashReportingSettings } from './types';
+import { SubmitIssueReportDto } from './dto/submit-issue-report.dto';
+import { currentLogScope } from './log-capture.context';
+
+/**
+ * Service for capturing crash reports and logs with strict redaction.
+ * All captured data is redacted to remove secrets, keys, and PII.
+ * Feature is opt-in and disabled by default.
+ */
+@Injectable()
+export class CrashReportingService {
+  private readonly logger = new Logger(CrashReportingService.name);
+  private readonly maxLogLines = 100; // Last N log lines to capture, per request
+  // #1063: no instance-level log buffer. The service is a singleton shared by
+  // every request, so lines live in the per-request scope from
+  // log-capture.context.ts (opened by LogCaptureMiddleware) instead.
+
+  constructor(
+    private readonly redactionService: RedactionService,
+    private readonly repository: CrashReportingRepository,
+  ) {}
+
+  /**
+   * Capture a log line into the current request's buffer.
+   * Outside a request scope the line is dropped rather than pooled, so it can
+   * never end up in another user's crash report or export (#1063).
+   * @param logLine - The log line to capture
+   */
+  captureLogLine(logLine: string): void {
+    const scope = currentLogScope();
+    if (!scope) {
+      return;
+    }
+    // Keep only the last N lines
+    if (scope.lines.length >= this.maxLogLines) {
+      scope.lines.shift();
+    }
+    scope.lines.push(logLine);
+  }
+
+  /** Copy of the current request's captured lines (empty outside a scope). */
+  private currentLogLines(): string[] {
+    return [...(currentLogScope()?.lines ?? [])];
+  }
+
+  /**
+   * Capture a crash report with redacted logs
+   * @param userId - The user ID (optional)
+   * @param error - The error that caused the crash
+   * @param context - Additional context about the crash
+   * @returns The created crash report ID
+   */
+  async captureCrash(
+    userId: string | undefined,
+    error: Error,
+    context?: Record<string, unknown>,
+  ): Promise<string | null> {
+    try {
+      // Check if user has opted in (if userId provided)
+      if (userId) {
+        const settings = await this.repository.getUserSettings(userId);
+        if (!settings?.crashReportingEnabled) {
+          this.logger.debug(`Crash reporting disabled for user ${userId}`);
+          return null;
+        }
+      }
+
+      // Redact error and context
+      const redactedError = this.redactionService.redactError(error);
+      const redactedContext = context 
+        ? this.redactionService.redactObject(context) 
+        : undefined;
+
+      // Redact log lines — only the requesting user's own request (#1063)
+      const redactedLogs = this.redactionService.redactLogLines(this.currentLogLines());
+
+      // Create crash report
+      const crashReport: Omit<CrashReport, 'id' | 'createdAt'> = {
+        userId,
+        error: redactedError,
+        context: redactedContext as Record<string, unknown> | undefined,
+        logLines: redactedLogs,
+        timestamp: new Date(),
+      };
+
+      const reportId = await this.repository.createCrashReport(crashReport);
+      
+      this.logger.log(`Crash report captured: ${reportId}`);
+      
+      return reportId;
+    } catch (err) {
+      // Don't let crash reporting itself crash the application
+      this.logger.error('Failed to capture crash report', err);
+      return null;
+    }
+  }
+
+  /**
+   * Get user's crash reporting settings
+   * @param userId - The user ID
+   * @returns The user's settings
+   */
+  async getUserSettings(userId: string): Promise<CrashReportingSettings | null> {
+    return this.repository.getUserSettings(userId);
+  }
+
+  /**
+   * Update user's crash reporting settings
+   * @param userId - The user ID
+   * @param enabled - Whether crash reporting is enabled
+   */
+  async updateUserSettings(userId: string, enabled: boolean): Promise<void> {
+    await this.repository.updateUserSettings(userId, enabled);
+    this.logger.log(`Crash reporting ${enabled ? 'enabled' : 'disabled'} for user ${userId}`);
+  }
+
+  /**
+   * Export logs for support (only if user has opted in)
+   * @param userId - The user ID
+   * @returns The log export data
+   */
+  async exportLogs(userId: string): Promise<LogExport | null> {
+    try {
+      const settings = await this.repository.getUserSettings(userId);
+      
+      if (!settings?.crashReportingEnabled) {
+        this.logger.warn(`User ${userId} attempted to export logs but has not opted in`);
+        return null;
+      }
+
+      // Get recent crash reports for this user
+      const crashReports = await this.repository.getCrashReportsByUser(userId, 10);
+
+      // Redact the current request's log buffer — never other users' (#1063)
+      const redactedLogs = this.redactionService.redactLogLines(this.currentLogLines());
+
+      const logExport: LogExport = {
+        userId,
+        exportedAt: new Date(),
+        currentLogs: redactedLogs,
+        crashReports: crashReports.map(report => ({
+          id: report.id,
+          timestamp: report.timestamp,
+          error: report.error,
+          context: report.context,
+          logLines: report.logLines,
+        })),
+      };
+
+      this.logger.log(`Logs exported for user ${userId}`);
+
+      return logExport;
+    } catch (err) {
+      this.logger.error(`Failed to export logs for user ${userId}`, err);
+      return null;
+    }
+  }
+
+  /**
+   * Get crash reports for a user
+   * @param userId - The user ID
+   * @param limit - Maximum number of reports to return
+   * @returns Array of crash reports
+   */
+  async getCrashReports(userId: string, limit = 10): Promise<CrashReport[]> {
+    const settings = await this.repository.getUserSettings(userId);
+    
+    if (!settings?.crashReportingEnabled) {
+      return [];
+    }
+
+    return this.repository.getCrashReportsByUser(userId, limit);
+  }
+
+  /**
+   * Get all crash reports (for admin retrieval)
+   * @param limit - Maximum number of reports to return
+   * @returns Array of crash reports
+   */
+  async getAllReports(limit = 50): Promise<CrashReport[]> {
+    return this.repository.getAllCrashReports(limit);
+  }
+
+  /**
+   * Clear the current request's log buffer (useful for testing)
+   */
+  clearLogBuffer(): void {
+    const scope = currentLogScope();
+    if (scope) {
+      scope.lines.length = 0;
+    }
+  }
+
+  /**
+   * Get the current request's log buffer size
+   */
+  getLogBufferSize(): number {
+    return currentLogScope()?.lines.length ?? 0;
+  }
+
+  /**
+   * Submit a crash/issue report from client-side integration
+   * @param dto - The issue report payload
+   * @returns The created crash report ID
+   */
+  async submitIssueReport(dto: SubmitIssueReportDto): Promise<string> {
+    const redactedMessage = this.redactionService.redact(dto.userMessage || 'Unhandled Error');
+    const redactedDetails = dto.errorDetails ? this.redactionService.redact(dto.errorDetails) : undefined;
+    const redactedEnvironment = dto.environment ? this.redactionService.redact(dto.environment) : undefined;
+    const redactedRoute = dto.route ? this.redactionService.redact(dto.route) : undefined;
+    const redactedReproductionSteps = dto.reproductionSteps ? this.redactionService.redact(dto.reproductionSteps) : undefined;
+    const redactedAttachments = dto.attachments ? dto.attachments.map(a => this.redactionService.redact(a)) : undefined;
+
+    const crashReport: Omit<CrashReport, 'id' | 'createdAt'> = {
+      userId: undefined,
+      error: {
+        name: 'UnhandledException',
+        message: redactedMessage,
+        stack: redactedDetails,
+      },
+      context: {
+        environment: redactedEnvironment,
+        route: redactedRoute,
+        reproductionSteps: redactedReproductionSteps,
+        attachments: redactedAttachments,
+      },
+      logLines: [],
+      timestamp: new Date(),
+    };
+
+    const reportId = await this.repository.createCrashReport(crashReport);
+    this.logger.log(`Crash report captured via intake endpoint: ${reportId}`);
+    return reportId;
+  }
+}

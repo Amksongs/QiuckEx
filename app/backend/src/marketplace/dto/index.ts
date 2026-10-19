@@ -2,3 +2,6 @@ export * from './list-username.dto';
 export * from './place-bid.dto';
 export * from './accept-bid.dto';
 export * from './cancel-listing.dto';
+export * from './marketplace-listing-detail.dto';
+export * from './get-marketplace-listings.dto';
+export * from './marketplace-listing-summary.dto';

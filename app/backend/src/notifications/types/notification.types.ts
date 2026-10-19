@@ -28,7 +28,18 @@ export type NotificationEventType =
   | "recurring.link.paused"
   | "recurring.link.resumed"
   | "recurring.link.completed"
-  | "auto_reconciliation.succeeded";
+  | "auto_reconciliation.succeeded"
+  | "payment.link.expired"
+  | "export.completed"
+  | "export.failed";
+
+export type PaymentLinkExpiredEvent = "payment.link.expired";
+
+export interface PaymentLinkExpiredPayload extends BaseNotificationPayload {
+  eventType: PaymentLinkExpiredEvent;
+  linkId: string;
+  expiredAt: string | null;
+}
 
 export interface BaseNotificationPayload {
   /** The event kind — used to match against user preference filters. */
@@ -47,6 +58,10 @@ export interface BaseNotificationPayload {
   amountStroops?: bigint;
   /** Arbitrary extra context for provider templates. */
   metadata?: Record<string, unknown>;
+  /** Preview scope identifier when the event originated from a preview environment. */
+  previewScope?: string;
+  /** Correlation id of the originating request, propagated for end-to-end tracing. */
+  correlationId?: string;
 }
 
 export interface EscrowDepositedPayload extends BaseNotificationPayload {
@@ -141,6 +156,33 @@ export interface AutoReconciliationSucceededNotificationPayload extends BaseNoti
   confidence: number;
 }
 
+export interface ExportCompletedPayload extends BaseNotificationPayload {
+  eventType: "export.completed";
+  /** Type of data contained in the export (transactions, links, payments). */
+  exportType: string;
+  /** Export file format (csv or json). */
+  format: string;
+  /** Number of records included in the export. */
+  recordCount: number;
+  /** ID of the export generation job this notification belongs to. */
+  jobId: string;
+}
+
+export interface ExportFailedPayload extends BaseNotificationPayload {
+  eventType: "export.failed";
+  /** Type of data that was being exported (transactions, links, payments). */
+  exportType: string;
+  /** Export file format that was requested (csv or json). */
+  format: string;
+  /** ID of the export generation job that failed. */
+  jobId: string;
+  /**
+   * User-safe reason code describing why the export failed.
+   * Must NOT contain internal stack traces or raw database errors.
+   */
+  failureReason: string;
+}
+
 export type NotificationPayload =
   | EscrowDepositedPayload
   | EscrowWithdrawnPayload
@@ -151,7 +193,10 @@ export type NotificationPayload =
   | RecurringPaymentExecutedPayload
   | RecurringPaymentFailedPayload
   | RecurringLinkStatusPayload
-  | AutoReconciliationSucceededNotificationPayload;
+  | AutoReconciliationSucceededNotificationPayload
+  | PaymentLinkExpiredPayload
+  | ExportCompletedPayload
+  | ExportFailedPayload;
 
 // ---------------------------------------------------------------------------
 // User preferences

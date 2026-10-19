@@ -2,6 +2,7 @@ import { Injectable, Logger } from "@nestjs/common";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
 import { AppConfigService } from "../config";
+import { createTracedFetch } from "../tracing/traced-fetch";
 import {
   EscrowDbStatus,
   EscrowRecord,
@@ -27,6 +28,34 @@ export interface SearchProfileResult {
 export interface TrendingCreatorResult extends SearchProfileResult {
   transaction_volume: number;
   transaction_count: number;
+}
+
+export interface FeaturedProfileResult extends SearchProfileResult {
+  featured_rank: number | null;
+}
+
+/**
+ * The editable presentation fields behind `GET`/`PUT /profile`.
+ *
+ * Mirrors `ProfileCustomization` in `src/usernames/usernames.repository.ts`;
+ * kept local to match how every other usernames type is duplicated in this
+ * file (see `SearchProfileResult`).
+ */
+export interface ProfileCustomization {
+  primary_color: string | null;
+  avatar_url: string | null;
+  bio: string | null;
+  twitter_handle: string | null;
+  discord_handle: string | null;
+  github_handle: string | null;
+}
+
+export interface ProfileResult extends ProfileCustomization {
+  id: string;
+  username: string;
+  public_key: string;
+  created_at: string;
+  is_public: boolean;
 }
 
 export interface MarketplaceListing {
@@ -64,6 +93,16 @@ export interface VerifiedAssetDbRecord {
   updated_at: string;
 }
 
+/**
+ * Deterministic ascending tiebreaker used when the primary ranking metric
+ * (volume, activity timestamp, featured rank) is equal between two rows.
+ */
+function compareIdsAsc(a: { id: string }, b: { id: string }): number {
+  if (a.id < b.id) return -1;
+  if (a.id > b.id) return 1;
+  return 0;
+}
+
 @Injectable()
 export class SupabaseService {
   private readonly logger = new Logger(SupabaseService.name);
@@ -78,6 +117,12 @@ export class SupabaseService {
     this.client = createClient(url, anonKey, {
       auth: {
         persistSession: false,
+      },
+      global: {
+        // Instruments every PostgREST/RPC call this client makes with a
+        // db.* span, so all ~30 query methods below get tracing for free
+        // instead of each being wrapped individually.
+        fetch: createTracedFetch("db.supabase"),
       },
     });
 
@@ -125,6 +170,26 @@ export class SupabaseService {
     if (error) this.handleError(error);
   }
 
+  /**
+   * Atomically claim a username and record the `username.claimed` domain event
+   * in the outbox, so the event is durable before it is dispatched. See the
+   * `claim_username_with_outbox` Postgres function.
+   */
+  async claimUsernameWithOutbox(
+    username: string,
+    publicKey: string,
+    eventId: string,
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    const { error } = await this.client.rpc("claim_username_with_outbox", {
+      p_username: username,
+      p_public_key: publicKey,
+      p_event_id: eventId,
+      p_payload: payload,
+    });
+    if (error) this.handleError(error);
+  }
+
   async countUsernamesByPublicKey(publicKey: string): Promise<number> {
     const { count, error } = await this.client
       .from("usernames")
@@ -144,6 +209,18 @@ export class SupabaseService {
     if (error) this.handleError(error);
     return data ?? [];
   }
+
+  async getUsername(username: string): Promise<SearchProfileResult | null> {
+    const { data, error } = await this.client
+      .from("usernames")
+      .select("id, username, public_key, created_at, last_active_at, is_public")
+      .eq("username", username.toLowerCase())
+      .maybeSingle();
+
+    if (error) this.handleError(error);
+    return data as SearchProfileResult | null;
+  }
+
 
   // ---------------------------------------------------------------------------
   // Reconciliation helpers
@@ -383,17 +460,19 @@ export class SupabaseService {
       },
     );
 
-    // Get top creators by volume
-    const topCreators = Array.from(volumeMap.entries())
-      .sort((a, b) => b[1].volume - a[1].volume)
-      .slice(0, limit);
+    // Rank all candidates by volume first. Slicing to `limit` must happen
+    // *after* filtering to public profiles below, otherwise a candidate that
+    // ranks in the true top-N of public profiles could be dropped here just
+    // because non-public accounts occupied the top volume slots.
+    const rankedCandidates = Array.from(volumeMap.entries()).sort(
+      (a, b) => b[1].volume - a[1].volume,
+    );
 
-    // Fetch public profiles for these creators
-    if (topCreators.length === 0) {
+    if (rankedCandidates.length === 0) {
       return [];
     }
 
-    const publicKeys = topCreators.map(([key]) => key);
+    const publicKeys = rankedCandidates.map(([key]) => key);
     const { data: profiles, error: profilesError } = await this.client
       .from("usernames")
       .select("id, username, public_key, created_at, last_active_at, is_public")
@@ -405,21 +484,30 @@ export class SupabaseService {
       return [];
     }
 
-    // Merge volume data with profile data
-    return (profiles ?? [])
-      .map((profile: SearchProfileResult) => {
-        const found = topCreators.find(([key]) => key === profile.public_key);
-        const stats = found ? found[1] : { volume: 0, count: 0 };
+    const profileByKey = new Map(
+      (profiles ?? []).map((profile: SearchProfileResult) => [
+        profile.public_key,
+        profile,
+      ]),
+    );
+
+    // Merge volume data with profile data. Ties in volume are broken by `id`
+    // so the ranking is deterministic and stable across identical requests.
+    return rankedCandidates
+      .filter(([key]) => profileByKey.has(key))
+      .map(([key, stats]) => {
+        const profile = profileByKey.get(key) as SearchProfileResult;
         return {
           ...profile,
           transaction_volume: stats.volume,
           transaction_count: stats.count,
         } as TrendingCreatorResult;
       })
-      .sort(
-        (a: TrendingCreatorResult, b: TrendingCreatorResult) =>
-          (b.transaction_volume || 0) - (a.transaction_volume || 0),
-      );
+      .sort((a: TrendingCreatorResult, b: TrendingCreatorResult) => {
+        const diff = (b.transaction_volume || 0) - (a.transaction_volume || 0);
+        return diff !== 0 ? diff : compareIdsAsc(a, b);
+      })
+      .slice(0, limit);
   }
 
   /**
@@ -489,14 +577,16 @@ export class SupabaseService {
       return [];
     }
 
-    // Fetch public profiles for these active users
+    // Fetch public profiles for these active users. We intentionally do not
+    // limit or order at the DB level here: `last_active_at` on this table can
+    // be stale compared to the payment-derived activity merged in below, so
+    // limiting before that merge could drop candidates that actually rank in
+    // the true top-N. Ranking and limiting happen after the merge instead.
     const { data: profiles, error: profilesError } = await this.client
       .from("usernames")
       .select("id, username, public_key, created_at, last_active_at, is_public")
       .in("public_key", Array.from(activePublicKeys))
-      .eq("is_public", true)
-      .order("last_active_at", { ascending: false })
-      .limit(limit);
+      .eq("is_public", true);
 
     if (profilesError) {
       this.logger.warn(`Failed to fetch profiles: ${profilesError.message}`);
@@ -529,7 +619,8 @@ export class SupabaseService {
       },
     );
 
-    // Merge with profile data and sort by activity
+    // Merge with profile data and sort by activity. Ties are broken by `id`
+    // so the ranking is deterministic and stable across identical requests.
     return (profiles ?? [])
       .map((profile: SearchProfileResult) => ({
         ...profile,
@@ -539,9 +630,78 @@ export class SupabaseService {
       .sort((a: SearchProfileResult, b: SearchProfileResult) => {
         const aTime = new Date(a.last_active_at || a.created_at).getTime();
         const bTime = new Date(b.last_active_at || b.created_at).getTime();
-        return bTime - aTime;
+        return bTime !== aTime ? bTime - aTime : compareIdsAsc(a, b);
       })
       .slice(0, limit);
+  }
+
+  /**
+   * Get curated/featured usernames for discovery, ordered by manual
+   * `featured_rank` (ascending, nulls last) with `id` as a deterministic
+   * tiebreaker.
+   */
+  async getFeaturedUsernames(
+    limit: number = 10,
+  ): Promise<FeaturedProfileResult[]> {
+    const { data, error } = await this.client
+      .from("usernames")
+      .select(
+        "id, username, public_key, created_at, last_active_at, is_public, featured_rank",
+      )
+      .eq("is_public", true)
+      .eq("is_featured", true)
+      .order("featured_rank", { ascending: true, nullsFirst: false })
+      .order("id", { ascending: true })
+      .limit(limit);
+
+    if (error) this.handleError(error);
+
+    return (data ?? []) as FeaturedProfileResult[];
+  }
+
+  /**
+   * Fetch a single public profile by username
+   */
+  async getPublicProfile(
+    username: string,
+  ): Promise<SearchProfileResult | null> {
+    const { data, error } = await this.client
+      .from("usernames")
+      .select(
+        "id, username, public_key, created_at, last_active_at, is_public",
+      )
+      .eq("username", username)
+      .eq("is_public", true)
+      .single();
+
+    if (error) {
+      if (error.code === "PGRST116") return null; // not found
+      this.handleError(error);
+    }
+
+    return (data as SearchProfileResult) ?? null;
+  }
+
+  /**
+   * Fetch the full profile row (including presentation fields) for a public
+   * profile. The `is_public = true` filter is baked into the query, so there is
+   * no TOCTOU window between a visibility check and the data fetch.
+   */
+  async getPublicProfileForDisplay(
+    username: string,
+  ): Promise<ProfileResult | null> {
+    const { data, error } = await this.client
+      .from("usernames")
+      .select(
+        "id, username, public_key, created_at, is_public, primary_color, avatar_url, bio, twitter_handle, discord_handle, github_handle",
+      )
+      .eq("username", username)
+      .eq("is_public", true)
+      .maybeSingle();
+
+    if (error) this.handleError(error);
+
+    return (data as ProfileResult) ?? null;
   }
 
   /**
@@ -562,6 +722,60 @@ export class SupabaseService {
     if (error) this.handleError(error);
   }
 
+  /**
+   * Load a profile with its presentation fields, ignoring visibility.
+   *
+   * Used by `GET /profile`, which the owner calls on their own profile even
+   * while `is_public` is false, so the settings page can show current values
+   * for a private profile. Ownership is verified by the caller.
+   */
+  async getProfileForOwner(username: string): Promise<ProfileResult | null> {
+    const { data, error } = await this.client
+      .from("usernames")
+      .select(
+        "id, username, public_key, created_at, is_public, primary_color, avatar_url, bio, twitter_handle, discord_handle, github_handle",
+      )
+      .eq("username", username)
+      .maybeSingle();
+
+    if (error) this.handleError(error);
+
+    return (data as ProfileResult) ?? null;
+  }
+
+  /**
+   * Persist the presentation fields for a profile row and return the new state.
+   *
+   * Returning the row rather than void lets the controller echo exactly what was
+   * persisted, so the client does not have to guess how the database normalized
+   * the values.
+   */
+  async updateProfileCustomization(
+    username: string,
+    customization: ProfileCustomization,
+  ): Promise<ProfileResult | null> {
+    const { data, error } = await this.client
+      .from("usernames")
+      .update({
+        primary_color: customization.primary_color,
+        avatar_url: customization.avatar_url,
+        bio: customization.bio,
+        twitter_handle: customization.twitter_handle,
+        discord_handle: customization.discord_handle,
+        github_handle: customization.github_handle,
+        last_active_at: new Date().toISOString(),
+      })
+      .eq("username", username)
+      .select(
+        "id, username, public_key, created_at, is_public, primary_color, avatar_url, bio, twitter_handle, discord_handle, github_handle",
+      )
+      .maybeSingle();
+
+    if (error) this.handleError(error);
+
+    return (data as ProfileResult) ?? null;
+  }
+
   async createListing(
     username: string,
     sellerPublicKey: string,
@@ -580,26 +794,87 @@ export class SupabaseService {
     return data as MarketplaceListing;
   }
 
-  async getActiveListings(
-    limit: number,
-    cursor: string | null,
+  async searchActiveListings(
+    query: string,
+    limit: number = 10,
   ): Promise<{ listings: MarketplaceListing[]; next_cursor: string | null; has_more: boolean; total: number }> {
+    const normalizedQuery = query.trim().toLowerCase();
     const effectiveLimit = Math.min(100, Math.max(1, limit));
+
+    let dbQuery = this.client
+      .from("username_marketplace")
+      .select("*", { count: "exact" })
+      .eq("status", "active");
+
+    if (normalizedQuery) {
+      dbQuery = dbQuery.or(`username.ilike.%${normalizedQuery}%,seller_public_key.ilike.%${normalizedQuery}%`);
+    }
+
+    const { data, error, count } = await dbQuery
+      .order("created_at", { ascending: false })
+      .order("id", { ascending: false })
+      .limit(effectiveLimit + 1);
+
+    if (error) this.handleError(error);
+
+    const rows = (data ?? []) as MarketplaceListing[];
+    const hasMore = rows.length > effectiveLimit;
+    const listings = hasMore ? rows.slice(0, effectiveLimit) : rows;
+
+    return {
+      listings,
+      next_cursor: null,
+      has_more: hasMore,
+      total: count ?? rows.length,
+    };
+  }
+
+  /**
+   * Query active listings with sort, price range, and username filters,
+   * using cursor-based pagination.
+   *
+   * The cursor filter mirrors the pattern used by `getActiveListings`
+   * above rather than the generic `applyCursorFilter` util: it fetches
+   * `limit + 1` rows ordered by (sortColumn, id) and decodes an opaque
+   * `{ pk, id }` cursor where `pk` is the value of whatever column is
+   * currently being sorted on.
+   */
+  async queryActiveListings(options: {
+    limit: number;
+    cursor: string | null;
+    sortColumn: 'created_at' | 'asking_price';
+    ascending: boolean;
+    minPrice?: number;
+    maxPrice?: number;
+    username?: string;
+  }): Promise<{ listings: MarketplaceListing[]; next_cursor: string | null; has_more: boolean; total: number }> {
+    const effectiveLimit = Math.min(100, Math.max(1, options.limit));
+    const { sortColumn, ascending } = options;
 
     let query = this.client
       .from('username_marketplace')
       .select('*', { count: 'exact' })
       .eq('status', 'active');
 
-    if (cursor) {
-      // Decode cursor
+    if (options.minPrice !== undefined) {
+      query = query.gte('asking_price', options.minPrice);
+    }
+    if (options.maxPrice !== undefined) {
+      query = query.lte('asking_price', options.maxPrice);
+    }
+    if (options.username) {
+      query = query.ilike('username', `%${options.username.trim().toLowerCase()}%`);
+    }
+
+    if (options.cursor) {
       try {
-        const json = Buffer.from(cursor, 'base64url').toString('utf-8');
+        const json = Buffer.from(options.cursor, 'base64url').toString('utf-8');
         const parsed = JSON.parse(json);
         if (typeof parsed.pk === 'string' && typeof parsed.id === 'string') {
-          query = query
-            .lt('created_at', parsed.pk)
-            .or(`created_at.eq.${parsed.pk},id.lt.${parsed.id}`);
+          const cmpOp = ascending ? 'gt' : 'lt';
+          query = query[cmpOp](sortColumn, parsed.pk).or(
+            `${sortColumn}.eq.${parsed.pk},id.${cmpOp}.${parsed.id}`,
+          );
         }
       } catch {
         // invalid cursor – start from beginning
@@ -607,8 +882,8 @@ export class SupabaseService {
     }
 
     query = query
-      .order('created_at', { ascending: false })
-      .order('id', { ascending: false })
+      .order(sortColumn, { ascending })
+      .order('id', { ascending })
       .limit(effectiveLimit + 1);
 
     const { data, error, count } = await query;
@@ -620,9 +895,9 @@ export class SupabaseService {
 
     let nextCursor: string | null = null;
     if (hasMore && listings.length > 0) {
-      const last = listings[listings.length - 1];
+      const last = listings[listings.length - 1] as unknown as Record<string, unknown>;
       nextCursor = Buffer.from(
-        JSON.stringify({ pk: last.created_at, id: last.id }),
+        JSON.stringify({ pk: String(last[sortColumn]), id: String(last['id']) }),
         'utf-8',
       ).toString('base64url');
     }
@@ -633,6 +908,22 @@ export class SupabaseService {
       has_more: hasMore,
       total: count ?? 0,
     };
+  }
+
+  /**
+   * Batch-fetch bids for a set of listing ids, used to attach bid summary
+   * data to a page of listings without an N+1 query per listing.
+   */
+  async getBidsForListingIds(listingIds: string[]): Promise<MarketplaceBid[]> {
+    if (listingIds.length === 0) {
+      return [];
+    }
+    const { data, error } = await this.client
+      .from('username_bids')
+      .select('*')
+      .in('listing_id', listingIds);
+    if (error) this.handleError(error);
+    return (data ?? []) as MarketplaceBid[];
   }
 
   async getBidsByListingIdPaginated(

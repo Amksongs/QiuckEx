@@ -1,5 +1,6 @@
 // Marketplace mock data and simulated API calls
 
+import { getQuickexApiBase } from "@/lib/api";
 export type UsernameStatus = "auction" | "buyNow" | "sold" | "listed";
 
 export type MarketplaceListing = {
@@ -179,17 +180,84 @@ const MOCK_USER_LISTINGS: UserListing[] = [
   },
 ];
 
-export async function fetchListings(): Promise<MarketplaceListing[]> {
-  if (cachedListings) {
-    return Promise.resolve(cachedListings);
+export function mapBackendListingToCardListing(item: BackendMarketplaceListing): MarketplaceListing {
+  const createdAt = new Date(item.created_at || Date.now());
+  let hash = 0;
+  const keyStr = item.id || item.username || "";
+  for (let i = 0; i < keyStr.length; i++) {
+    hash = (hash << 5) - hash + keyStr.charCodeAt(i);
+    hash |= 0;
+  }
+  const absHash = Math.abs(hash);
+  const currentBid = Number(item.asking_price) || 0;
+
+  const lower = item.username.toLowerCase();
+  let category: "trending" | "short" | "og" | "crypto" | "brand" = "trending";
+  if (item.username.length <= 3) category = "short";
+  else if (["satoshi", "btc", "eth", "sol", "defi", "web3"].includes(lower)) category = "crypto";
+  else if (["pay", "alex", "john", "dev"].includes(lower)) category = "og";
+  else if (["nova", "lux", "apex", "star"].includes(lower)) category = "brand";
+
+  return {
+    id: item.id,
+    username: item.username,
+    currentBid,
+    buyNowPrice: Number(item.asking_price) || null,
+    ownerAddress: item.seller_public_key ? formatPublicKey(item.seller_public_key) : "GDRH...4T9F",
+    endsAt: new Date(createdAt.getTime() + 1000 * 60 * 60 * 48),
+    createdAt,
+    status: item.status === "active" ? "auction" : item.status === "sold" ? "sold" : "listed",
+    category,
+    bidCount: absHash % 15,
+    watchers: (absHash % 100) + 5,
+    verified: item.username.length <= 4 || ["satoshi", "pay", "sol", "web3"].includes(lower),
+  };
+}
+
+export type FetchListingsOptions = {
+  limit?: number;
+  cursor?: string;
+  bypassCache?: boolean;
+};
+
+export async function fetchListings(options: FetchListingsOptions = {}): Promise<MarketplaceListing[]> {
+  const { limit = 100, cursor, bypassCache = false } = options;
+
+  if (!bypassCache && cachedListings) {
+    return cachedListings;
   }
 
-  return new Promise((resolve) =>
-    setTimeout(() => {
-      cachedListings = MOCK_LISTINGS;
-      resolve(MOCK_LISTINGS);
-    }, 900),
-  );
+  const url = new URL(`${getQuickexApiBase()}/marketplace`);
+  url.searchParams.set("limit", limit.toString());
+  if (cursor) {
+    url.searchParams.set("cursor", cursor);
+  }
+
+  try {
+    const response = await fetch(url.toString(), {
+      method: "GET",
+      headers: { Accept: "application/json" },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to load marketplace listings (${response.status})`);
+    }
+
+    const data = (await response.json()) as {
+      listings: BackendMarketplaceListing[];
+      total: number;
+      next_cursor: string | null;
+      has_more: boolean;
+    };
+
+    const mapped = (data.listings || []).map(mapBackendListingToCardListing);
+    cachedListings = mapped;
+    return mapped;
+  } catch (err) {
+    console.warn("Marketplace backend query error, returning fallback list:", err);
+    cachedListings = MOCK_LISTINGS;
+    return MOCK_LISTINGS;
+  }
 }
 
 export async function fetchUserBids(): Promise<UserBid[]> {
@@ -218,24 +286,270 @@ export async function fetchUserListings(): Promise<UserListing[]> {
   );
 }
 
-export type BidResult = { success: true } | { success: false; reason: string };
+export type BidErrorCode =
+  | "network"
+  | "validation"
+  | "insufficient_funds"
+  | "unauthorized"
+  | "not_found"
+  | "conflict"
+  | "unknown";
+
+export type BidResult =
+  | { success: true; bid?: BackendMarketplaceBid }
+  | { success: false; reason: string; code?: BidErrorCode; details?: string };
+
+export type PlaceBidOptions = {
+  listingId?: string;
+  bidderPublicKey?: string;
+};
+
+function getStoredWalletPublicKey(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem("quickex.wallet.session");
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return typeof parsed?.publicKey === "string" ? parsed.publicKey : null;
+  } catch {
+    return null;
+  }
+}
+
+const DEFAULT_DEMO_BIDDER_KEY = "GBXGQ55JMQ4L2B6E7S8Y9Z0A1B2C3D4E5F6G7H8I7YWR";
 
 export async function placeBid(
-  username: string,
-  amount: number
+  usernameOrListingId: string,
+  amount: number,
+  options?: PlaceBidOptions
 ): Promise<BidResult> {
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      // Simulate ~10% chance of wallet rejection, otherwise success
-      if (Math.random() < 0.1) {
-        resolve({ success: false, reason: "User rejected the transaction in wallet." });
+  let resolvedListingId = options?.listingId;
+
+  if (!resolvedListingId) {
+    if (cachedListings) {
+      const matchById = cachedListings.find((item) => item.id === usernameOrListingId);
+      if (matchById) {
+        resolvedListingId = matchById.id;
       } else {
-        console.log(`Bid placed: ${amount} USDC on @${username}`);
-        resolve({ success: true });
+        const matchByUsername = cachedListings.find(
+          (item) => item.username.toLowerCase() === usernameOrListingId.toLowerCase()
+        );
+        if (matchByUsername) {
+          resolvedListingId = matchByUsername.id;
+        }
       }
-    }, 2200);
-  });
+    }
+  }
+
+  if (!resolvedListingId) {
+    resolvedListingId = usernameOrListingId;
+  }
+
+  const bidderPublicKey =
+    options?.bidderPublicKey?.trim() ||
+    getStoredWalletPublicKey() ||
+    DEFAULT_DEMO_BIDDER_KEY;
+
+  const url = `${getQuickexApiBase()}/marketplace/${encodeURIComponent(resolvedListingId)}/bid`;
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        bidderPublicKey,
+        bidAmount: amount,
+      }),
+    });
+
+    if (response.ok) {
+      const data = (await response.json().catch(() => ({}))) as { bid?: BackendMarketplaceBid };
+      return {
+        success: true,
+        bid: data.bid,
+      };
+    }
+
+    const errorData = await response.json().catch(() => null);
+    let rawReason = "";
+    if (errorData) {
+      if (Array.isArray(errorData.message)) {
+        rawReason = errorData.message.join(", ");
+      } else if (typeof errorData.message === "string") {
+        rawReason = errorData.message;
+      } else if (typeof errorData.error === "string") {
+        rawReason = errorData.error;
+      }
+    }
+
+    if (!rawReason) {
+      rawReason = `Failed to place bid (${response.status} ${response.statusText || ""})`.trim();
+    }
+
+    const lower = rawReason.toLowerCase();
+    let code: BidErrorCode = "unknown";
+
+    if (
+      response.status === 402 ||
+      lower.includes("insufficient") ||
+      lower.includes("balance") ||
+      lower.includes("funds")
+    ) {
+      code = "insufficient_funds";
+    } else if (
+      response.status === 400 ||
+      response.status === 422 ||
+      lower.includes("invalid") ||
+      lower.includes("must be") ||
+      lower.includes("seller cannot bid") ||
+      errorData?.code === "MARKETPLACE_INVALID_PRICE" ||
+      errorData?.code === "MARKETPLACE_SELF_BID"
+    ) {
+      code = "validation";
+    } else if (response.status === 401 || response.status === 403 || errorData?.code === "MARKETPLACE_UNAUTHORIZED") {
+      code = "unauthorized";
+    } else if (response.status === 404 || errorData?.code === "LISTING_NOT_FOUND") {
+      code = "not_found";
+    } else if (response.status === 409 || errorData?.code === "USERNAME_ALREADY_LISTED" || errorData?.code === "LISTING_NOT_ACTIVE") {
+      code = "conflict";
+    } else if (response.status >= 500) {
+      code = "network";
+    }
+
+    return {
+      success: false,
+      reason: rawReason,
+      code,
+    };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to connect to the marketplace service.";
+    return {
+      success: false,
+      reason: message,
+      code: "network",
+    };
+  }
 }
+
+export type BackendListingStatus = "active" | "sold" | "cancelled";
+
+export type BackendMarketplaceListing = {
+  id: string;
+  username: string;
+  seller_public_key: string;
+  asking_price: number;
+  status: BackendListingStatus;
+  created_at: string;
+  updated_at: string;
+  sold_at: string | null;
+  buyer_public_key: string | null;
+  final_price: number | null;
+};
+
+export type BackendMarketplaceBid = {
+  id: string;
+  listing_id: string;
+  bidder_public_key: string;
+  bid_amount: number;
+  status: "pending" | "accepted" | "rejected" | "cancelled";
+  created_at: string;
+  updated_at: string;
+};
+
+export type MarketplaceStateHints = {
+  can_place_bid: boolean;
+  can_watchlist: boolean;
+  can_buy_now: boolean;
+  is_available: boolean;
+  unavailable_reason: string | null;
+  minimum_bid_amount: number;
+};
+
+export type MarketplaceSellerInfo = {
+  public_key: string;
+  display_key: string;
+};
+
+export type MarketplaceListingDetail = {
+  listing: BackendMarketplaceListing;
+  bids: BackendMarketplaceBid[];
+  seller: MarketplaceSellerInfo;
+  state_hints: MarketplaceStateHints;
+};
+
+export class ListingDetailNotFoundError extends Error {
+  constructor(listingId: string) {
+    super(`Listing ${listingId} was not found.`);
+    this.name = "ListingDetailNotFoundError";
+  }
+}
+
+export async function fetchListingDetail(
+  listingId: string,
+  viewerPublicKey?: string,
+): Promise<MarketplaceListingDetail> {
+  const url = new URL(`${getQuickexApiBase()}/marketplace/${listingId}/detail`);
+  if (viewerPublicKey?.trim()) {
+    url.searchParams.set("viewerPublicKey", viewerPublicKey.trim());
+  }
+
+  const response = await fetch(url.toString(), {
+    method: "GET",
+    headers: { Accept: "application/json" },
+  });
+
+  if (response.status === 404) {
+    throw new ListingDetailNotFoundError(listingId);
+  }
+
+  if (!response.ok) {
+    throw new Error(`Failed to load listing detail (${response.status}).`);
+  }
+
+  return (await response.json()) as MarketplaceListingDetail;
+}
+
+export function mapListingDetailToCardListing(
+  detail: MarketplaceListingDetail,
+): MarketplaceListing {
+  const { listing, bids, seller, state_hints } = detail;
+  const currentBid = Math.max(state_hints.minimum_bid_amount - 1, Number(listing.asking_price));
+  const pendingBidCount = bids.filter((bid) => bid.status === "pending").length;
+  const createdAt = new Date(listing.created_at);
+
+  const status: UsernameStatus =
+    listing.status === "active"
+      ? "auction"
+      : listing.status === "sold"
+        ? "sold"
+        : "listed";
+
+  return {
+    id: listing.id,
+    username: listing.username,
+    currentBid,
+    buyNowPrice: null,
+    ownerAddress: seller.display_key,
+    endsAt: createdAt,
+    createdAt,
+    status,
+    category: "trending",
+    bidCount: pendingBidCount,
+    watchers: 0,
+    verified: false,
+  };
+}
+
+export function formatPublicKey(publicKey: string): string {
+  if (publicKey.length <= 12) {
+    return publicKey;
+  }
+  return `${publicKey.slice(0, 4)}...${publicKey.slice(-4)}`;
+}
+
 
 export function formatCountdown(date: Date): string {
   const diff = date.getTime() - Date.now();

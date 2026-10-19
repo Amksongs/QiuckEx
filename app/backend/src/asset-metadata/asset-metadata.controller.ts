@@ -24,6 +24,7 @@ import { Request, Response } from "express";
 import * as crypto from "crypto";
 
 import { ApiKeyGuard } from "../auth/guards/api-key.guard";
+import { RateLimitGroupTag, RateLimitTier } from "../auth/decorators/rate-limit-group.decorator";
 import { AssetMetadataService } from "./asset-metadata.service";
 import {
   AssetMetadataResponseDto,
@@ -38,6 +39,7 @@ import { AdminVerifyAssetDto } from "./dto/admin-asset.dto";
   required: false,
 })
 @UseGuards(ApiKeyGuard)
+@RateLimitGroupTag("public")
 @Controller("assets")
 export class AssetMetadataController {
   private readonly logger = new Logger(AssetMetadataController.name);
@@ -45,6 +47,7 @@ export class AssetMetadataController {
   constructor(private readonly assetMetadataService: AssetMetadataService) {}
 
   @Get()
+  @RateLimitTier("public-read")
   @ApiOperation({
     summary: "List all verified assets with metadata",
     description:
@@ -87,6 +90,7 @@ export class AssetMetadataController {
   }
 
   @Get(":code")
+  @RateLimitTier("public-read")
   @ApiOperation({
     summary: "Get metadata for a specific asset",
     description:
@@ -138,6 +142,7 @@ export class AssetMetadataController {
   }
 
   @Post("admin/verify")
+  @RateLimitTier("mutation")
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: "Mark asset verified or unverified",
@@ -166,6 +171,7 @@ export class AssetMetadataController {
   }
 
   @Post(":code/refresh")
+  @RateLimitTier("mutation")
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: "Refresh asset metadata cache",
@@ -196,6 +202,7 @@ export class AssetMetadataController {
   }
 
   @Get("cache/stats")
+  @RateLimitTier("public-read")
   @ApiOperation({
     summary: "Get cache statistics",
     description: "Returns statistics about the asset metadata cache.",
@@ -209,6 +216,7 @@ export class AssetMetadataController {
   }
 
   @Post("cache/clear")
+  @RateLimitTier("mutation")
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({
     summary: "Clear asset metadata cache",

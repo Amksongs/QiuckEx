@@ -3,12 +3,15 @@ import { Module, forwardRef } from "@nestjs/common";
 import { SupabaseModule } from "../supabase/supabase.module";
 import { JobQueueModule } from "../job-queue/job-queue.module";
 import { MetricsModule } from "../metrics/metrics.module";
+import { ContractsModule } from "../contracts/contracts.module";
+import { ApiKeysModule } from "../api-keys/api-keys.module";
 import { CursorRepository } from "./cursor.repository";
 import { EscrowEventRepository } from "./escrow-event.repository";
 import { PrivacyEventRepository } from "./privacy-event.repository";
 import { AdminEventRepository } from "./admin-event.repository";
 import { StealthEventRepository } from "./stealth-event.repository";
 import { IndexerCheckpointRepository } from "./indexer-checkpoint.repository";
+import { UnparsedSorobanEventRepository } from "./unparsed-soroban-event.repository";
 import { SorobanEventParser } from "./soroban-event.parser";
 import { StellarIngestionService } from "./stellar-ingestion.service";
 import { SorobanEventIndexerService } from "./soroban-event-indexer.service";
@@ -20,6 +23,8 @@ import { IngestionBootstrapService } from "./ingestion-bootstrap.service";
     SupabaseModule,
     forwardRef(() => JobQueueModule),
     MetricsModule,
+    ContractsModule,
+    ApiKeysModule,
   ],
   controllers: [SorobanIndexerController],
   providers: [
@@ -29,6 +34,7 @@ import { IngestionBootstrapService } from "./ingestion-bootstrap.service";
     AdminEventRepository,
     StealthEventRepository,
     IndexerCheckpointRepository,
+    UnparsedSorobanEventRepository,
     SorobanEventParser,
     StellarIngestionService,
     SorobanEventIndexerService,
@@ -40,6 +46,8 @@ import { IngestionBootstrapService } from "./ingestion-bootstrap.service";
     SorobanEventParser,
     CursorRepository,
     EscrowEventRepository,
+    UnparsedSorobanEventRepository,
+    IndexerCheckpointRepository,
   ],
 })
 export class IngestionModule {}

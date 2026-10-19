@@ -9,13 +9,16 @@ declare namespace Express {
       name: string;
       scopes: string[];
       rateLimit: number;
+      owner_id?: string | null;
       organization_id?: string | null;
     };
     organizationContext?: {
       organizationId?: string;
       role: "admin" | "member" | "read_only";
     };
-  }
+    /** Preview scope identifier from the X-Preview-Scope header. */
+    previewScope?: string;
+  };
 }
 
 export {};

@@ -280,10 +280,12 @@ export class JobExecutor implements OnModuleInit {
         const handler = this.registry.getHandler(job.type);
         await handler.onFailure(job, error);
       } catch (hookError) {
-        this.logger.error(
-          `Failed to execute onFailure hook for job ${job.id}: ${hookError.message}`,
-          hookError.stack,
-        );
+        this.logger.error({
+          message: `Failed to execute onFailure hook for job ${job.id}`,
+          jobId: job.id,
+          error: hookError.message,
+          stack: hookError.stack,
+        });
       }
 
       // Clean up cancellation token
@@ -303,6 +305,7 @@ export class JobExecutor implements OnModuleInit {
       // Update gauge metrics: running -> pending
       this.metrics.updateJobsRunningCount(job.type, -1);
       this.metrics.updateJobsPendingCount(job.type, 1);
+      this.metrics.incrementJobsRetried(job.type);
 
       this.logger.log(
         `Job ${job.id} scheduled for retry in ${retryDelayMs}ms (type: ${job.type}, attempt: ${newAttempts}/${policy.maxAttempts})`,

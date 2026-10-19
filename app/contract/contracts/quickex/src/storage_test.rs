@@ -224,6 +224,21 @@ fn test_contract_version_storage() {
 }
 
 #[test]
+fn test_initialized_flag_storage() {
+    let env = Env::default();
+    let contract_id = env.register(crate::QuickexContract, ());
+    env.as_contract(&contract_id, || {
+        assert!(!is_initialized(&env));
+
+        set_initialized(&env, true);
+        assert!(is_initialized(&env));
+
+        set_initialized(&env, false);
+        assert!(!is_initialized(&env));
+    });
+}
+
+#[test]
 fn test_admin_storage() {
     let env = Env::default();
     let contract_id = env.register(crate::QuickexContract, ());
@@ -250,15 +265,21 @@ fn test_paused_storage() {
         assert!(!is_paused(&env));
 
         // Test setting paused to true
-        set_paused(&env, true);
+        set_paused(&env, true, 1);
         assert!(is_paused(&env));
+        assert_eq!(get_global_pause_reason(&env), 1);
 
         // Test setting paused to false
-        set_paused(&env, false);
+        set_paused(&env, false, 0);
         assert!(!is_paused(&env));
+        assert_eq!(get_global_pause_reason(&env), 0);
     });
 }
 
+/// Issue #862 (SC-W8-01): `PrivacyLevel` is now a read-only migration
+/// fallback with no dedicated setter — legacy data is simulated here via a
+/// raw storage write, matching how a pre-consolidation deployment would have
+/// left it. See `crate::privacy` for the canonical boolean state.
 #[test]
 fn test_privacy_storage() {
     let env = Env::default();
@@ -267,17 +288,18 @@ fn test_privacy_storage() {
         let account = Address::generate(&env);
         let privacy_level = 5u32;
 
-        // Test setting privacy level
-        set_privacy_level(&env, &account, privacy_level);
+        // Simulate a legacy numeric level, as pre-consolidation code would have written.
+        env.storage()
+            .persistent()
+            .set(&DataKey::PrivacyLevel(account.clone()), &privacy_level);
         assert_eq!(get_privacy_level(&env, &account).unwrap(), privacy_level);
 
-        // Test updating privacy level
-        let new_privacy_level = 10u32;
-        set_privacy_level(&env, &account, new_privacy_level);
-        assert_eq!(
-            get_privacy_level(&env, &account).unwrap(),
-            new_privacy_level
-        );
+        // clear_privacy_level removes it, as happens once the account is
+        // migrated onto the canonical key.
+        clear_privacy_level(&env, &account);
+        assert!(get_privacy_level(&env, &account).is_none());
+        // Clearing an already-absent key is a no-op, not an error.
+        clear_privacy_level(&env, &account);
 
         // Test privacy history
         add_privacy_history(&env, &account, 15u32);
@@ -294,5 +316,35 @@ fn test_privacy_storage() {
         let non_existent_account = Address::generate(&env);
         assert!(get_privacy_level(&env, &non_existent_account).is_none());
         assert_eq!(get_privacy_history(&env, &non_existent_account).len(), 0);
+    });
+}
+
+/// Regression: `set_pause_flags` used to hardcode `[1, 2, 4, 8, 16, 32]` when
+/// maintaining the `FeaturePauseReasons` map. That list was written before
+/// `PauseFlag::FeeWithdrawal = 64` was added, so pausing fee withdrawals set
+/// the bitmask but `get_feature_pause_reason(FeeWithdrawal)` always returned
+/// 0. The reason map must now cover every variant in `PauseFlag::ALL`.
+#[test]
+fn test_feature_pause_reason_recorded_for_every_pause_flag() {
+    let env = Env::default();
+    let contract_id = env.register(crate::QuickexContract, ());
+    env.as_contract(&contract_id, || {
+        let caller = Address::generate(&env);
+
+        // The originally reported flag must be part of the derived list.
+        assert!(PauseFlag::ALL.contains(&PauseFlag::FeeWithdrawal));
+        assert_eq!(PauseFlag::FeeWithdrawal.bits(), 64u64);
+
+        for (i, flag) in PauseFlag::ALL.iter().enumerate() {
+            let reason = 100 + i as u32;
+
+            set_pause_flags(&env, &caller, flag.bits(), 0, reason);
+            assert!(is_feature_paused(&env, *flag));
+            assert_eq!(get_feature_pause_reason(&env, *flag), reason);
+
+            set_pause_flags(&env, &caller, 0, flag.bits(), 0);
+            assert!(!is_feature_paused(&env, *flag));
+            assert_eq!(get_feature_pause_reason(&env, *flag), 0);
+        }
     });
 }

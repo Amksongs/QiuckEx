@@ -8,9 +8,14 @@ import {
   Query,
   HttpCode,
   HttpStatus,
+  UseInterceptors,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiQuery } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiQuery, ApiHeader } from '@nestjs/swagger';
 import { RecurringPaymentsService } from './recurring-payments.service';
+import {
+  IdempotencyInterceptor,
+  IDEMPOTENCY_KEY_HEADER,
+} from '../common/idempotency/idempotency.interceptor';
 import {
   CreateRecurringPaymentLinkDto,
   UpdateRecurringPaymentLinkDto,
@@ -20,8 +25,16 @@ import {
   RecurringStatus,
   RecurringPaymentExecutionDto,
 } from './dto/recurring-payment.dto';
+import { RateLimitTier } from '../auth/decorators/rate-limit-group.decorator';
 
 @ApiTags('recurring-payments')
+@ApiHeader({
+  name: IDEMPOTENCY_KEY_HEADER,
+  description:
+    'Optional. Supply a unique key to make create/update/execute mutations idempotent: retries with the same key and body return the original response; reuse with a different body is rejected.',
+  required: false,
+})
+@UseInterceptors(IdempotencyInterceptor)
 @Controller('links/recurring')
 export class RecurringPaymentsController {
   constructor(private readonly service: RecurringPaymentsService) {}
@@ -31,6 +44,7 @@ export class RecurringPaymentsController {
   // ---------------------------------------------------------------------------
 
   @Post()
+  @RateLimitTier("mutation")
   @HttpCode(HttpStatus.CREATED)
   @ApiOperation({
     summary: 'Create a new recurring payment link',
@@ -56,6 +70,7 @@ export class RecurringPaymentsController {
   }
 
   @Get(':id')
+  @RateLimitTier("public-read")
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: 'Get recurring payment link by ID',
@@ -82,6 +97,7 @@ export class RecurringPaymentsController {
   }
 
   @Get()
+  @RateLimitTier("public-read")
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: 'List recurring payment links',
@@ -108,6 +124,7 @@ export class RecurringPaymentsController {
   }
 
   @Patch(':id')
+  @RateLimitTier("mutation")
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: 'Update recurring payment link',
@@ -143,6 +160,7 @@ export class RecurringPaymentsController {
   // ---------------------------------------------------------------------------
 
   @Post(':id/cancel')
+  @RateLimitTier("mutation")
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: 'Cancel recurring payment link',
@@ -173,6 +191,7 @@ export class RecurringPaymentsController {
   }
 
   @Post(':id/pause')
+  @RateLimitTier("mutation")
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: 'Pause recurring payment link',
@@ -203,6 +222,7 @@ export class RecurringPaymentsController {
   }
 
   @Post(':id/resume')
+  @RateLimitTier("mutation")
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: 'Resume recurring payment link',
@@ -237,6 +257,7 @@ export class RecurringPaymentsController {
   // ---------------------------------------------------------------------------
 
   @Get(':id/executions')
+  @RateLimitTier("public-read")
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: 'Get execution history',

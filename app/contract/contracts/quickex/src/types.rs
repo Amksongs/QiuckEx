@@ -50,12 +50,25 @@ pub struct EscrowEntry {
     /// A value of `0` means the escrow never expires (no timeout).
     pub expires_at: u64,
     /// Optional single arbiter address for dispute resolution (legacy).
+    ///
+    /// `None` for an escrow created by `deposit_multi_sig`, which names its
+    /// arbiters in `arbiters` instead.
     pub arbiter: Option<Address>,
-    /// Array of arbiter addresses for multi-sig dispute resolution.
+    /// Ordered set of arbiter addresses for multi-sig dispute resolution.
+    ///
+    /// Populated only by [`crate::escrow::deposit_multi_sig`], which rejects an
+    /// empty set, more than [`crate::dispute_quorum::MAX_ARBITERS`] entries, and
+    /// duplicate addresses. Empty means single-arbiter mode.
     pub arbiters: Vec<Address>,
     /// Threshold: number of arbiter votes required to resolve a dispute (M-of-N).
     /// A value of 0 means single-arbiter mode (uses `arbiter` field).
-    /// A value > 0 means multi-sig mode (uses `arbiters` array).
+    /// A value > 0 means multi-sig mode (uses `arbiters` array) and is bounded
+    /// to `1..=arbiters.len()` at deposit time.
+    ///
+    /// Note that the *effective* quorum is the per-dispute snapshot frozen
+    /// from [`crate::dispute_quorum::DisputeQuorumConfig`] when the dispute
+    /// opens, clamped to `arbiters.len()`; this field is the depositor's
+    /// M-of-N declaration and the mode switch the dispute entrypoints gate on.
     pub arbiter_threshold: u32,
 }
 
@@ -129,9 +142,9 @@ pub struct StealthDepositParams {
     pub amount_paid: i128,
     /// Sender's ephemeral public key (32 bytes).
     pub eph_pub: BytesN<32>,
-    /// Recipient's spend public key (32 bytes).
+    /// Recipient spend-key bytes (32 bytes); public and not curve-validated.
     pub spend_pub: BytesN<32>,
-    /// Pre-computed one-time stealth address (32 bytes).
+    /// Pre-computed 32-byte stealth escrow identifier (not a Stellar address).
     pub stealth_address: BytesN<32>,
     /// Seconds until expiry; 0 = no expiry.
     pub timeout_secs: u64,
@@ -156,8 +169,8 @@ pub struct StealthEscrowEntry {
     pub amount_due: i128,
     /// Amount already paid towards the escrow.
     pub amount_paid: i128,
-    /// Sender's ephemeral public key (32 bytes). Stored so the recipient can
-    /// scan events and re-derive the shared secret off-chain.
+    /// Sender's ephemeral public-key bytes (32 bytes), stored for the escrow.
+    /// The current hash construction uses public inputs and is not a DH secret.
     pub eph_pub: BytesN<32>,
     /// Current lifecycle status.
     pub status: EscrowStatus,
@@ -207,6 +220,36 @@ pub struct OracleFeeConfig {
     pub stale_threshold_secs: u64,
 }
 
+/// A cached oracle price record with its timestamp for staleness checking.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedOraclePrice {
+    /// Price in microdollars per token unit (1_000_000 = 1 USD).
+    pub price_micros: i128,
+    /// Ledger timestamp when this price was recorded.
+    pub recorded_at: u64,
+}
+
+/// Multi-source oracle aggregation configuration (SC-W8-06 / Issue #867).
+///
+/// Controls how [`crate::oracle::fetch_aggregated_price`] combines the
+/// registered oracle sources' individually-cached prices into a single
+/// trusted price: fresh sources (per the existing staleness guard) are
+/// combined via median, sources deviating beyond `max_deviation_bps` from
+/// that median are excluded, and the result fails closed with
+/// `OracleInsufficientSources` if fewer than `min_sources` remain.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OracleAggregationConfig {
+    /// Minimum number of fresh, non-outlier sources required for a valid
+    /// aggregated price. Must be at least 1.
+    pub min_sources: u32,
+    /// Maximum allowed deviation from the median, in basis points
+    /// (10_000 = 100%). A source priced further from the median than this
+    /// is excluded from the final price.
+    pub max_deviation_bps: u32,
+}
+
 /// Deployment metadata returned by [`crate::QuickexContract::get_deployment_metadata`].
 ///
 /// Clients and indexers can call this view to validate compatibility without
@@ -251,6 +294,31 @@ pub enum HookEventKind {
     Refund = 3,
 }
 
+/// Canonical hook invocation failure/skip reason codes (SC-W7-05).
+///
+/// Emitted on [`crate::events::HookInvocationFailedEvent`] and
+/// [`crate::events::HookInvocationSkippedEvent`]. Stable across releases —
+/// never renumber or remove an existing variant, only append new ones.
+/// Off-chain indexers and dashboards key on these numeric values, so a
+/// reorder would silently reclassify past events.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum HookFailureReason {
+    /// The hook contract's `on_escrow_event` call aborted — it panicked,
+    /// trapped, or exceeded a resource limit. Corresponds to
+    /// `InvokeError::Abort` (or an `InvokeError::Contract` code that never
+    /// reached a decodable contract error) from `try_invoke_contract`.
+    InvocationAborted = 1,
+    /// The hook contract ran to completion but returned an explicit
+    /// contract error instead of succeeding.
+    ContractError = 2,
+    /// The hook was not invoked at all because `invoke_hooks` was entered
+    /// while the reentrancy guard was already held. Every hook registered
+    /// for this event was skipped, not just one.
+    ReentrancyGuardActive = 3,
+}
+
 /// Privileged roles for contract governance and operations.
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -262,4 +330,34 @@ pub enum Role {
     Operator = 2,
     /// Authorized to resolve disputes across escrows.
     Arbiter = 3,
+}
+
+/// Canonical pause reason codes.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum PauseReason {
+    Unknown = 0,
+    SystemMaintenance = 1,
+    SecurityEmergency = 2,
+    FeatureUpgrade = 3,
+    RegulatoryCompliance = 4,
+    OperatorIntervention = 5,
+}
+
+/// A pending, timelocked admin transfer.
+///
+/// Stored under [`DataKey::PendingAdminProposal`](crate::storage::DataKey::PendingAdminProposal)
+/// (singleton) while a proposal is outstanding. Cleared on accept or cancel.
+#[contracttype]
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PendingAdminProposal {
+    /// Address proposed to become the new admin.
+    pub proposed_admin: Address,
+    /// Admin address that created the proposal (informational only — any
+    /// current admin, not just this address, may cancel the proposal via
+    /// `cancel_admin_transfer`).
+    pub proposed_by: Address,
+    /// Ledger timestamp at which `accept_admin_transfer` becomes callable.
+    pub eligible_at: u64,
 }

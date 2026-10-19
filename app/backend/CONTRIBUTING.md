@@ -56,6 +56,20 @@ Server starts at `http://localhost:4000` with API docs at `http://localhost:4000
 - Return predictable response shapes
 - Document all responses in Swagger
 
+### Route Prefix Conventions
+
+A controller's `@Controller(...)` argument **is** its public route prefix —
+`main.ts` does not call `setGlobalPrefix`. Canonical prefixes are unprefixed
+resource paths (`contracts`, `links/recurring`, `admin/refunds`); `api/`,
+`mobile/`, and `v1/` are never part of a route, and versioning is declared once
+in Swagger rather than per controller.
+
+A small, closed set of non-canonical prefixes is exempt (compatibility aliases
+and grandfathered `v1/` routes). The rule is checked mechanically against every
+`src/**/*.controller.ts` by the unit suite and by `pnpm check:routes` — a new
+controller is validated without anyone registering it. Full convention,
+exemptions, and the review checklist: [`docs/ROUTING-CONVENTIONS.md`](../../docs/ROUTING-CONVENTIONS.md).
+
 ### Security
 
 - **Never log secret values** (keys, tokens, passwords)
@@ -408,6 +422,7 @@ Before submitting a PR, ensure:
 - [ ] Swagger decorators added to new endpoints and DTOs
 - [ ] DTO validation added/updated with descriptive messages
 - [ ] Unit/integration tests added and passing
+- [ ] New/changed controller routes follow [`docs/ROUTING-CONVENTIONS.md`](../../docs/ROUTING-CONVENTIONS.md) (`pnpm check:routes`), with any client that calls a changed route updated in the same PR
 - [ ] Schema validation tests added for new env vars
 - [ ] `pnpm turbo run type-check --filter=@quickex/backend` passes
 - [ ] `pnpm turbo run lint --filter=@quickex/backend` passes
@@ -429,6 +444,28 @@ pnpm turbo run type-check --filter=@quickex/backend
 # Linting
 pnpm turbo run lint --filter=@quickex/backend
 
+# Route prefix conventions (also enforced by the unit suite)
+pnpm --filter @quickex/backend check:routes
+
 # Build
 pnpm turbo run build --filter=@quickex/backend
 ```
+
+## Demo Mode (Testnet Only)
+
+Demo mode seeds deterministic payment links and sample transactions so contributors can exercise UI flows immediately after checkout.
+
+**Requirements:** `NETWORK=testnet`, admin-scoped API key.
+
+```bash
+# Seed all demo fixtures
+curl -X POST https://<host>/v1/demo/seed -H "X-API-Key: <admin-key>"
+
+# Check what's currently seeded
+curl https://<host>/v1/demo/status -H "X-API-Key: <admin-key>"
+
+# Remove all demo data
+curl -X DELETE https://<host>/v1/demo -H "X-API-Key: <admin-key>"
+```
+
+Seeded data is deterministic - running seed twice produces identical state. Demo mode returns HTTP 403 on any non-testnet environment.

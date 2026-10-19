@@ -10,6 +10,11 @@ This contract provides the foundational privacy and escrow capabilities for the 
 - **Escrow Services**: Secure holding of assets during transactions
 - **Audit Trails**: Maintainable history of privacy state changes
 
+## Contract reference
+
+- Entrypoint API reference: [doc/CONTRACT_ENTRYPOINT_REFERENCE.md](doc/CONTRACT_ENTRYPOINT_REFERENCE.md)
+- Stealth derivation and fixed test vectors: [docs/STEALTH_ADDRESS_DERIVATION.md](docs/STEALTH_ADDRESS_DERIVATION.md)
+
 ## Prerequisites
 
 - Rust 1.70 or higher
@@ -107,6 +112,22 @@ soroban contract deploy \
   --network mainnet
 ```
 
+## Contract Spec Export
+
+Export the contract's method/argument spec, along with the current
+contract and event schema versions, as a stable JSON artifact:
+
+```bash
+./scripts/export-contract-spec.sh
+```
+
+The artifact is written to `docs/contract-spec/contract-spec.json` and
+includes `contract_version`, `event_schema_version`, and the full function
+interface, so contributors and tooling can introspect available methods
+without reading the Rust source. `scripts/test-contract-spec-export.sh`
+verifies the export is stable across repeat builds and includes all
+required fields.
+
 ## Development Workflow
 
 1. Make changes to the contract code
@@ -118,26 +139,36 @@ soroban contract deploy \
 ## Main Flows
 
 ### 1. Deployment & initialisation
+
 1. Deploy the contract WASM.
 2. Call `initialize(admin)` once to set the admin (required for pause, upgrade, admin transfer).
 
 ### 2. Deposit → Withdraw (escrow)
+
 1. **Deposit**: Call `deposit(token, amount, owner, salt)` or `deposit_with_commitment(from, token, amount, commitment)`. The owner/from must authorize the token transfer.
 2. Store the returned commitment (or the one you provided) securely; it is required to withdraw.
 3. **Withdraw**: Call `withdraw(_token, amount, _commitment, to, salt)` with `to` as the recipient. The commitment is recomputed from `to`, `amount`, and `salt`; it must match an existing pending escrow. `to` must authorize.
 
 ### 3. Privacy
-- **Boolean**: `set_privacy(owner, enabled)` and `get_privacy(owner)` for on/off privacy.
-- **Level-based**: `enable_privacy(account, level)`, `privacy_status(account)`, `privacy_history(account)` for numeric levels.
+
+Privacy state is a single canonical boolean per account (Issue #862 / SC-W8-01), stored under `DataKey::PrivacyEnabled`. It is impossible for the two call styles below to disagree about the same account.
+
+- **Canonical**: `set_privacy(owner, enabled)` and `get_privacy(owner)`.
+- **Deprecated shim**: `enable_privacy(account, level)` (`level` must be `0` or `1`), `privacy_status(account)`, `privacy_history(account)`. These delegate to the same underlying state and error handling as `set_privacy`/`get_privacy` — prefer the canonical pair for new integrations. Accounts whose state was last written through this deprecated API before the consolidation are transparently migrated onto the canonical key the first time either API touches them.
 
 ### 4. Admin
+
 - `set_paused(caller, new_state)` – pause/unpause (caller must be admin).
-- `set_admin(caller, new_admin)` – transfer admin.
+- `propose_admin_transfer(caller, new_admin, delay_secs)` – start a timelocked admin transfer (**Admin only**).
+- `accept_admin_transfer(caller)` – complete a pending admin transfer once its delay has elapsed (must be called by the proposed admin).
+- `cancel_admin_transfer(caller)` – cancel a pending admin transfer (**Admin only**).
+- `get_pending_admin_transfer()` – view the currently pending admin transfer proposal, if any.
 - `upgrade(caller, new_wasm_hash)` – upgrade contract (caller must authorize).
 - `migrate(caller)` – run post-upgrade storage migration steps for the current release.
 - `get_version()` – inspect the stored schema version (`0` means a legacy deployment with no version key yet).
 
 ### 5. Read-only queries
+
 - `get_commitment_state(commitment)` – escrow status (Pending/Spent/Expired).
 - `verify_proof_view(amount, salt, owner)` – verify withdrawal params without submitting a tx.
 - `get_escrow_details(commitment)` – full escrow entry.
@@ -156,10 +187,12 @@ The contract uses persistent storage with the following structure:
 - `DataKey::EscrowCounter` - Tracks the number of escrows created
 - `DataKey::Admin` - Stores the admin address
 - `DataKey::Paused` - Stores the paused state of the contract
-- `DataKey::PrivacyLevel(Address)` - Stores privacy level for each account
-- `DataKey::PrivacyHistory(Address)` - Stores privacy history for each account
+- `DataKey::PrivacyEnabled(Address)` - Canonical boolean privacy state for each account (single source of truth)
+- `DataKey::PrivacyLevel(Address)` - Deprecated numeric privacy level; read-only migration fallback
+- `DataKey::PrivacyHistory(Address)` - Append-only audit history from the deprecated `enable_privacy` shim
 
 The `EscrowEntry` struct contains:
+
 - `token: Address` - The token address
 - `amount: i128` - The escrowed amount
 - `owner: Address` - The owner of the escrow
@@ -167,15 +200,18 @@ The `EscrowEntry` struct contains:
 - `created_at: u64` - The ledger timestamp when created
 
 Helper functions:
+
 - `put_escrow(env: &Env, commitment: &Bytes, entry: &EscrowEntry)` - Store an escrow entry
 - `get_escrow(env: &Env, commitment: &Bytes)` - Retrieve an escrow entry
 - `has_escrow(env: &Env, commitment: &Bytes)` - Check if an escrow entry exists
 
 ### Privacy Management
 
-- `enable_privacy(account: Address, level: u32)` - Enable privacy for an account
-- `privacy_status(account: Address)` - Get privacy status for an account
-- `privacy_history(account: Address)` - Get privacy change history
+- `set_privacy(owner: Address, enabled: bool)` - Canonical entrypoint; enable/disable privacy for an account
+- `get_privacy(owner: Address)` - Canonical entrypoint; get current privacy state for an account
+- `enable_privacy(account: Address, privacy_level: u32)` - Deprecated shim (`privacy_level` must be `0` or `1`); delegates to `set_privacy`
+- `privacy_status(account: Address)` - Deprecated shim; get canonical privacy state as `Option<u32>`
+- `privacy_history(account: Address)` - Deprecated audit history of levels requested via `enable_privacy`
 
 ### Escrow
 
@@ -204,11 +240,11 @@ The amount commitment functions provide a **placeholder** for X-Ray privacy shie
 
 Commitments are computed as `SHA256(owner_bytes || amount_bytes || salt_bytes)`:
 
-| Component | Size | Format | Description |
-|-----------|------|--------|-------------|
-| Owner | Variable | XDR-serialized Address | Soroban address bytes |
-| Amount | 16 bytes | Big-endian i128 | Transaction amount value |
-| Salt | 0-256 bytes | Raw bytes | Randomness for uniqueness |
+| Component | Size        | Format                 | Description               |
+| --------- | ----------- | ---------------------- | ------------------------- |
+| Owner     | Variable    | XDR-serialized Address | Soroban address bytes     |
+| Amount    | 16 bytes    | Big-endian i128        | Transaction amount value  |
+| Salt      | 0-256 bytes | Raw bytes              | Randomness for uniqueness |
 
 **Result**: 32-byte SHA256 hash
 
@@ -270,6 +306,7 @@ assert!(!client.verify_amount_commitment(&commitment, &other_owner, &amount, &sa
 ## View Functions (Read-Only RPC Calls)
 
 ### Check Commitment State
+
 ```bash
 stellar contract invoke \
   --id <CONTRACT_ID> \
@@ -279,6 +316,7 @@ stellar contract invoke \
 ```
 
 ### Verify Proof Before Withdrawal
+
 ```bash
 stellar contract invoke \
   --id <CONTRACT_ID> \
@@ -290,6 +328,7 @@ stellar contract invoke \
 ```
 
 ### Get Full Escrow Details
+
 ```bash
 soroban contract invoke \
   --id <CONTRACT_ID> \
@@ -298,10 +337,12 @@ soroban contract invoke \
   --commitment <COMMITMENT_HASH>
 ```
 
-
 ### Roadmap
 
 1. **Current (v0.1)**: Deterministic SHA256 commitments
 2. **Future (v0.2)**: Pedersen commitments with proper range proofs
 3. **Target (v1.0)**: Full zero-knowledge privacy via Zether or Circom
-````
+
+```
+
+```

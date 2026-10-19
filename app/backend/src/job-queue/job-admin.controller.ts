@@ -24,9 +24,11 @@ import {
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
 import { JobQueueService } from './job-queue.service';
 import { JobRepository, JobFilters } from './job.repository';
+import { JobReplayRepository } from './job-replay.repository';
 import { JobType, JobStatus, Job } from './types';
 import { ApiKeyGuard } from '../auth/guards/api-key.guard';
 import { RequireScopes } from '../auth/decorators/require-scopes.decorator';
+import { RateLimitTier } from '../auth/decorators/rate-limit-group.decorator';
 
 /**
  * DTO for bulk retry request
@@ -78,6 +80,7 @@ export class JobAdminController {
   constructor(
     private readonly jobQueueService: JobQueueService,
     private readonly jobRepository: JobRepository,
+    private readonly jobReplayRepository: JobReplayRepository,
   ) {}
 
   /**
@@ -92,6 +95,7 @@ export class JobAdminController {
    * **Validates: Requirements 5.1, 5.5**
    */
   @Get()
+  @RateLimitTier("public-read")
   @RequireScopes('admin')
   @ApiOperation({ summary: 'List jobs with filters' })
   @ApiResponse({ status: 200, description: 'Paginated job list' })
@@ -123,6 +127,7 @@ export class JobAdminController {
    * **Validates: Requirement 5.2**
    */
   @Get(':id')
+  @RateLimitTier("public-read")
   @RequireScopes('admin')
   @ApiOperation({ summary: 'Get job details by ID' })
   @ApiResponse({ status: 200, description: 'Job details' })
@@ -147,6 +152,7 @@ export class JobAdminController {
    * **Validates: Requirements 6.1, 6.2, 6.3**
    */
   @Post(':id/cancel')
+  @RateLimitTier("mutation")
   @RequireScopes('admin')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Cancel a job' })
@@ -163,17 +169,19 @@ export class JobAdminController {
    * Resets job status to pending, clears failureReason, and sets scheduledAt to now.
    * Rejects retry for completed or cancelled jobs.
    * Preserves original attempts count.
+   * Logs all replays for auditability.
    * 
    * **Validates: Requirements 14.1, 14.2, 14.3, 14.4**
    */
   @Post(':id/retry')
+  @RateLimitTier("mutation")
   @RequireScopes('admin')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Manually retry a failed job' })
   @ApiResponse({ status: 200, description: 'Job retry scheduled' })
   @ApiResponse({ status: 400, description: 'Job cannot be retried' })
   @ApiResponse({ status: 404, description: 'Job not found' })
-  async retryJob(@Param('id') id: string): Promise<{ message: string }> {
+  async retryJob(@Param('id') id: string): Promise<{ message: string; replayLogId: string }> {
     const job = await this.jobQueueService.getJob(id);
 
     if (!job) {
@@ -182,9 +190,33 @@ export class JobAdminController {
 
     // Requirement 14.3: Reject retry for completed or cancelled jobs
     if (job.status === JobStatus.COMPLETED || job.status === JobStatus.CANCELLED) {
+      // Log rejected replay attempt
+      await this.jobReplayRepository.createReplayLog({
+        jobId: id,
+        jobType: job.type,
+        status: 'rejected',
+        previousAttempts: job.attempts,
+        reason: `Cannot retry job in ${job.status} status`,
+        triggeredBy: 'api',
+      });
+
       throw new BadRequestException(
         `Cannot retry job in ${job.status} status. Only failed or pending jobs can be retried.`,
       );
+    }
+
+    // Create replay log before updating job status (auditable trail)
+    const replayLog = await this.jobReplayRepository.createReplayLog({
+      jobId: id,
+      jobType: job.type,
+      status: 'queued',
+      previousAttempts: job.attempts,
+      reason: 'Manual replay triggered by operator',
+      triggeredBy: 'api',
+    });
+
+    if (!replayLog) {
+      throw new Error('Failed to create replay audit log');
     }
 
     // Requirement 14.2: Reset status to pending, clear failureReason, set scheduledAt to now
@@ -195,22 +227,27 @@ export class JobAdminController {
       // Note: attempts count is preserved (not reset)
     });
 
-    return { message: `Job ${id} scheduled for retry` };
+    return { 
+      message: `Job ${id} scheduled for retry`,
+      replayLogId: replayLog.id
+    };
   }
 
   /**
    * Bulk retry jobs by type and status
    * 
    * Supports bulk retry for all jobs of a specific type in DLQ (failed status).
+   * Logs all replays for auditability.
    * 
    * **Validates: Requirement 14.5**
    */
   @Post('bulk-retry')
+  @RateLimitTier("mutation")
   @RequireScopes('admin')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Bulk retry jobs by type' })
   @ApiResponse({ status: 200, description: 'Bulk retry completed' })
-  async bulkRetry(@Body() request: BulkRetryRequestDto): Promise<BulkRetryResponse> {
+  async bulkRetry(@Body() request: BulkRetryRequestDto): Promise<BulkRetryResponse & { replayLogIds: string[] }> {
     const filters: JobFilters = {
       type: request.type,
       status: request.status || JobStatus.FAILED,
@@ -220,10 +257,25 @@ export class JobAdminController {
     const { jobs } = await this.jobQueueService.listJobs(filters);
 
     const retriedJobIds: string[] = [];
+    const replayLogIds: string[] = [];
 
     for (const job of jobs) {
       // Only retry failed jobs (DLQ)
       if (job.status === JobStatus.FAILED) {
+        // Create replay log before updating job status
+        const replayLog = await this.jobReplayRepository.createReplayLog({
+          jobId: job.id,
+          jobType: job.type,
+          status: 'queued',
+          previousAttempts: job.attempts,
+          reason: 'Bulk replay triggered by operator',
+          triggeredBy: 'api',
+        });
+
+        if (replayLog) {
+          replayLogIds.push(replayLog.id);
+        }
+
         await this.jobRepository.updateJobStatus(job.id, JobStatus.PENDING, {
           failureReason: null,
           scheduledAt: new Date(),
@@ -235,7 +287,27 @@ export class JobAdminController {
     return {
       retriedCount: retriedJobIds.length,
       jobIds: retriedJobIds,
+      replayLogIds,
     };
+  }
+
+  /**
+   * Get replay history for a specific job
+   * 
+   * Returns all manual replay attempts for a job, providing full audit trail.
+   */
+  @Get(':id/replays')
+  @RateLimitTier("public-read")
+  @RequireScopes('admin')
+  @ApiOperation({ summary: 'Get replay history for a job' })
+  @ApiResponse({ status: 200, description: 'Replay history retrieved' })
+  async getReplayHistory(@Param('id') id: string) {
+    const job = await this.jobQueueService.getJob(id);
+    if (!job) {
+      throw new NotFoundException(`Job not found: ${id}`);
+    }
+
+    return this.jobReplayRepository.getReplayLogsForJob(id);
   }
 
   /**
@@ -248,6 +320,7 @@ export class JobAdminController {
    * **Validates: Requirement 5.3**
    */
   @Get('metrics/summary')
+  @RateLimitTier("public-read")
   @RequireScopes('admin')
   @ApiOperation({ summary: 'Get job metrics summary' })
   @ApiResponse({ status: 200, description: 'Job metrics' })
@@ -305,22 +378,29 @@ export class JobAdminController {
    * Get dead letter queue (DLQ) jobs
    * 
    * Returns jobs where status=failed AND attempts >= maxAttempts.
-   * Supports pagination and filters.
+   * Supports pagination and filters by type, age, and failure reason.
    * 
    * **Validates: Requirement 5.4**
    */
   @Get('dlq')
+  @RateLimitTier("public-read")
   @RequireScopes('admin')
   @ApiOperation({ summary: 'Get dead letter queue jobs' })
   @ApiResponse({ status: 200, description: 'DLQ jobs' })
   async getDeadLetterQueue(
     @Query('type') type?: JobType,
+    @Query('failureReasonContains') failureReasonContains?: string,
+    @Query('createdAfter') createdAfter?: string,
+    @Query('createdBefore') createdBefore?: string,
     @Query('limit', new ParseIntPipe({ optional: true })) limit?: number,
     @Query('offset', new ParseIntPipe({ optional: true })) offset?: number,
   ) {
     const filters: JobFilters = {
       type,
       status: JobStatus.FAILED,
+      failureReasonContains,
+      createdAfter: createdAfter ? new Date(createdAfter) : undefined,
+      createdBefore: createdBefore ? new Date(createdBefore) : undefined,
       limit,
       offset,
     };

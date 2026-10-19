@@ -22,13 +22,14 @@ import { DeveloperService } from './developer.service';
 import {
   BulkRevokeDto,
   BulkRevokeResultDto,
+  WebhookSampleEventDto,
   WebhookTestResultDto,
   IntegrationHealthDto,
   PingResponseDto,
 } from './dto/developer.dto';
 import { ApiKeyCreated } from '../api-keys/api-keys.types';
 import { RequireScopes } from '../auth/decorators/require-scopes.decorator';
-import { RateLimitGroupTag } from '../auth/decorators/rate-limit-group.decorator';
+import { RateLimitGroupTag, RateLimitTier } from '../auth/decorators/rate-limit-group.decorator';
 
 @ApiTags('developer')
 @RateLimitGroupTag('authenticated')
@@ -37,6 +38,7 @@ export class DeveloperController {
   constructor(private readonly developerService: DeveloperService) {}
 
   @Get('ping')
+  @RateLimitTier('public-read')
   @ApiOperation({ summary: 'Connectivity check', description: 'Returns ok when the API is reachable. No authentication required.' })
   @ApiResponse({ status: 200, type: PingResponseDto })
   ping(): PingResponseDto {
@@ -44,6 +46,7 @@ export class DeveloperController {
   }
 
   @Post('webhooks/:webhookId/test')
+  @RateLimitTier('mutation')
   @HttpCode(HttpStatus.OK)
   @RequireScopes('admin')
   @ApiOperation({
@@ -59,7 +62,28 @@ export class DeveloperController {
     return this.developerService.testWebhook(webhookId);
   }
 
+  @Post('webhooks/:webhookId/sample-events')
+  @RateLimitTier('mutation')
+  @HttpCode(HttpStatus.OK)
+  @RequireScopes('admin')
+  @ApiOperation({
+    summary: 'Send a canonical sample event to a webhook receiver',
+    description:
+      'Posts a sample link.created, payment.received, payment.settled, or payment.failed payload. ' +
+      'The request can include signature headers and an explicit timestamp for receiver testing.',
+  })
+  @ApiParam({ name: 'webhookId', description: 'Webhook UUID' })
+  @ApiResponse({ status: 200, type: WebhookTestResultDto })
+  @ApiResponse({ status: 404, description: 'Webhook not found' })
+  sampleWebhookEvent(
+    @Param('webhookId', ParseUUIDPipe) webhookId: string,
+    @Body() dto: WebhookSampleEventDto,
+  ): Promise<WebhookTestResultDto> {
+    return this.developerService.sendSampleWebhookEvent(webhookId, dto);
+  }
+
   @Post('keys/bulk-revoke')
+  @RateLimitTier('mutation')
   @HttpCode(HttpStatus.OK)
   @RequireScopes('admin')
   @ApiOperation({
@@ -72,6 +96,7 @@ export class DeveloperController {
   }
 
   @Post('keys/:id/emergency-rotate')
+  @RateLimitTier('mutation')
   @HttpCode(HttpStatus.OK)
   @RequireScopes('admin')
   @ApiOperation({
@@ -88,6 +113,7 @@ export class DeveloperController {
   }
 
   @Get('health')
+  @RateLimitTier('public-read')
   @ApiOperation({
     summary: 'Integration health score',
     description: 'Returns a 0–100 score and letter grade based on webhook failure rate and API quota utilisation for a given organisation.',

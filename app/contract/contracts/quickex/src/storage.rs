@@ -8,19 +8,26 @@
 //!
 //! | Key Variant            | Value Type     | Description |
 //! |------------------------|----------------|-------------|
-//! | [`Escrow`](DataKey::Escrow) | `EscrowEntry`  | Escrow entry keyed by commitment hash (32 bytes). One entry per unique deposit. |
+//! | [`Escrow`](DataKey::Escrow) | `EscrowEntry`  | Legacy escrow entry keyed by commitment hash (32 bytes). Read as a fallback during lazy migration. |
+//! | [`EscrowCore`](DataKey::EscrowCore) | `CompactEscrowEntry` | Compact escrow record used for new writes and hot-path reads. |
+//! | [`EscrowDispute`](DataKey::EscrowDispute) | `EscrowDisputeConfig` | Optional dispute-only metadata written only when an escrow uses arbiters. |
 //! | [`EscrowCounter`](DataKey::EscrowCounter) | `u64`       | Global monotonic counter for escrow creation. |
 //! | [`ContractVersion`](DataKey::ContractVersion) | `u32` | Stored schema/version marker for upgrade migrations. |
 //! | [`Admin`](DataKey::Admin) | `Address`     | Contract admin address. Set during initialisation, transferable by admin. |
 //! | [`Paused`](DataKey::Paused) | `bool`       | Global pause flag. When true, critical operations may be blocked. |
-//! | [`PrivacyLevel`](DataKey::PrivacyLevel) | `u32`  | Numeric privacy level per account (0 = off). Used by `enable_privacy`. |
-//! | [`PrivacyHistory`](DataKey::PrivacyHistory) | `Vec<u32>` | Per-account history of privacy level changes (chronological). |
+//! | [`PrivacyEnabled`](DataKey::PrivacyEnabled) | `bool` | **Canonical** privacy state per account (Issue #862 / SC-W8-01). Single source of truth for `set_privacy`/`get_privacy`/`enable_privacy`/`privacy_status`. |
+//! | [`PrivacyLevel`](DataKey::PrivacyLevel) | `u32`  | **Deprecated.** Legacy numeric privacy level (0 = off, nonzero = on). Read as a migration fallback only; cleared the first time the account's state is written through any privacy entrypoint. |
+//! | [`PrivacyHistory`](DataKey::PrivacyHistory) | `Vec<u32>` | Bounded audit log of the latest 64 `{0, 1}` values requested through `enable_privacy`, newest first. Not authoritative. |
+//!
+//! `PrivacyHistory` retains at most 64 entries; its returned `Vec<u32>` encodes
+//! to at most 524 bytes of SCVal XDR. Legacy oversized records are bounded on
+//! read and compacted on the next successful append; canonical state is unchanged.
 //!
 //! ## Related Keys (legacy compatibility)
 //!
 //! | Key                    | Format                    | Value Type | Description |
 //! |------------------------|---------------------------|------------|-------------|
-//! | `privacy_enabled`      | `(Symbol, Address)`       | `bool`     | Legacy boolean privacy on/off key. Read as a fallback and migrated to [`DataKey::PrivacyEnabled`] on write. |
+//! | `privacy_enabled`      | `(Symbol, Address)`       | `bool`     | Legacy boolean privacy on/off key (pre-typed-`DataKey`). Read as a fallback and migrated to [`DataKey::PrivacyEnabled`] on write. |
 //!
 //! ## Relations
 //!
@@ -28,8 +35,13 @@
 //!   (`SHA256(owner || amount || salt)`). The stored [`EscrowEntry`] contains token, amount, owner,
 //!   status, and created_at.
 //! - **Admin ↔ Paused**: Admin can set the paused flag. Both are singleton keys.
-//! - **PrivacyLevel ↔ PrivacyHistory**: Same account may have both; level is current, history is append-only.
-//! - **PrivacyLevel / PrivacyHistory ↔ PrivacyEnabled**: Separate APIs; level-based vs boolean. Both persist per `Address`.
+//! - **PrivacyEnabled ↔ PrivacyLevel ↔ `privacy_enabled` (legacy Symbol key)**: All three describe the
+//!   same logical account state. [`DataKey::PrivacyEnabled`] is authoritative; the other two are read-only
+//!   migration fallbacks consulted (in that order) only when the canonical key is absent, and are cleared
+//!   as soon as the account is written through [`crate::privacy`]. This makes it impossible for
+//!   `get_privacy`/`set_privacy` and `enable_privacy`/`privacy_status` to disagree about one account.
+//! - **PrivacyLevel ↔ PrivacyHistory**: History retains the latest 64 levels requested through `enable_privacy`; it does not
+//!   itself determine state.
 //!
 //! ## Backwards Compatibility
 //!
@@ -38,15 +50,26 @@
 //! - **Add** new variants for new keys; they will not collide with existing ones.
 //! - **Value layout**: Changing `EscrowEntry` fields may require migration logic; adding optional
 //!   fields can be done carefully with defaults.
+//! - **Lazy migration**: Reads still fall back to the legacy [`DataKey::Escrow`] payload.
+//!   Any subsequent write rewrites the escrow into the compact layout and removes the
+//!   legacy record.
 
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Map, Vec};
 
-use crate::types::{DisputeVote, EscrowEntry, FeeConfig, Role, StealthEscrowEntry};
+#[cfg(test)]
+use soroban_sdk::xdr::ToXdr;
+
+use crate::errors::QuickexError;
+use crate::types::{
+    CachedOraclePrice, DisputeVote, EscrowEntry, FeeConfig, PendingAdminProposal, Role,
+    StealthEscrowEntry,
+};
 
 /// Record type for TTL policy selection.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RecordType {
     Escrow,
+    EscrowDispute,
     FeeConfig,
     StealthEscrow,
     EscrowIdMap,
@@ -61,10 +84,117 @@ pub struct TtlPolicy {
     pub ttl: u32,
 }
 
+impl TtlPolicy {
+    /// Maximum allowed TTL in ledgers (~3 years at 5s per ledger).
+    pub const MAX_TTL_LEDGERS: u32 = 18_921_600;
+
+    /// Validate the TTL policy bounds.
+    ///
+    /// Returns `Err` if:
+    /// - `ttl` is zero (no-op TTL is invalid)
+    /// - `ttl` exceeds the maximum allowed value
+    /// - `threshold` is zero (TTL extension would never trigger)
+    /// - `threshold` >= `ttl` (extension would be triggered too late)
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.ttl == 0 {
+            return Err("TtlPolicy: ttl must be > 0");
+        }
+        if self.ttl > Self::MAX_TTL_LEDGERS {
+            return Err("TtlPolicy: ttl exceeds maximum allowed ledgers");
+        }
+        if self.threshold == 0 {
+            return Err("TtlPolicy: threshold must be > 0");
+        }
+        if self.threshold >= self.ttl {
+            return Err("TtlPolicy: threshold must be < ttl");
+        }
+        Ok(())
+    }
+}
+
+/// Global dispute quorum configuration (singleton).
+///
+/// Stored under [`DataKey::DisputeQuorumConfig`]. Defines platform-wide bounds
+/// on arbiter counts and vote thresholds to prevent misconfigured escrows from
+/// getting permanently locked.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisputeQuorumConfig {
+    /// Maximum number of arbiters allowed in a multi-sig escrow (N in M-of-N).
+    pub max_arbiters: u32,
+    /// Maximum allowed quorum threshold (M in M-of-N). Must be <= max_arbiters.
+    pub max_quorum_threshold: u32,
+}
+
+impl DisputeQuorumConfig {
+    /// Hard maximum on arbiter count across all escrows.
+    pub const HARD_MAX_ARBITERS: u32 = 100;
+
+    /// Validate that the config is internally consistent and within hard bounds.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.max_arbiters == 0 {
+            return Err("DisputeQuorumConfig: max_arbiters must be > 0");
+        }
+        if self.max_arbiters > Self::HARD_MAX_ARBITERS {
+            return Err("DisputeQuorumConfig: max_arbiters exceeds hard maximum (100)");
+        }
+        if self.max_quorum_threshold == 0 {
+            return Err("DisputeQuorumConfig: max_quorum_threshold must be > 0");
+        }
+        if self.max_quorum_threshold > self.max_arbiters {
+            return Err("DisputeQuorumConfig: max_quorum_threshold must be <= max_arbiters");
+        }
+        Ok(())
+    }
+}
+
+/// Oracle aggregation configuration (singleton).
+///
+/// Stored under [`DataKey::OracleAggregationConfig`]. Defines platform-wide bounds
+/// on oracle fee pricing to prevent runaway fees or stale-price edge cases.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OracleAggregationConfig {
+    /// Maximum allowed USD fee in microdollars (1 USD = 1_000_000 microdollars).
+    /// Prevents an oracle from setting fees above an acceptable ceiling.
+    pub max_usd_fee_micros: i128,
+    /// Maximum allowed stale threshold in seconds before oracle data is rejected.
+    /// Prevents configs with unreasonably long stale windows.
+    pub max_stale_threshold_secs: u64,
+}
+
+impl OracleAggregationConfig {
+    /// Hard maximum fee: 10,000 USD in microdollars.
+    pub const HARD_MAX_USD_FEE_MICROS: i128 = 10_000_000_000;
+    /// Hard maximum stale window: 7 days in seconds.
+    pub const HARD_MAX_STALE_SECS: u64 = 604_800;
+
+    /// Validate that the config is within hard bounds.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.max_usd_fee_micros <= 0 {
+            return Err("OracleAggregationConfig: max_usd_fee_micros must be > 0");
+        }
+        if self.max_usd_fee_micros > Self::HARD_MAX_USD_FEE_MICROS {
+            return Err("OracleAggregationConfig: max_usd_fee_micros exceeds hard maximum");
+        }
+        if self.max_stale_threshold_secs == 0 {
+            return Err("OracleAggregationConfig: max_stale_threshold_secs must be > 0");
+        }
+        if self.max_stale_threshold_secs > Self::HARD_MAX_STALE_SECS {
+            return Err("OracleAggregationConfig: max_stale_threshold_secs exceeds 7-day limit");
+        }
+        Ok(())
+    }
+}
+
 /// Get TTL policy for a given record type.
 fn get_ttl_policy(record_type: RecordType) -> TtlPolicy {
     match record_type {
         RecordType::Escrow => TtlPolicy {
+            threshold: LEDGER_THRESHOLD,
+            ttl: SIX_MONTHS_IN_LEDGERS,
+        },
+        RecordType::EscrowDispute => TtlPolicy {
             threshold: LEDGER_THRESHOLD,
             ttl: SIX_MONTHS_IN_LEDGERS,
         },
@@ -98,6 +228,11 @@ pub const CURRENT_CONTRACT_VERSION: u32 = 1;
 pub const LEDGER_THRESHOLD: u32 = 17280; // ~1 day
 pub const SIX_MONTHS_IN_LEDGERS: u32 = 3110400; // ~185 days
 
+/// Minimum timelock (seconds) that must elapse between an admin-transfer
+/// proposal and its acceptance. The caller may configure a longer delay
+/// per-proposal, but never shorter than this floor (Issue #870).
+pub const MIN_ADMIN_TRANSFER_DELAY: u64 = 86_400; // 1 day
+
 /// Bitmask flags for granular operation pausing.
 #[contracttype]
 #[repr(u64)]
@@ -109,6 +244,43 @@ pub enum PauseFlag {
     DepositWithCommitment = 8,
     SetPrivacy = 16,
     CreateAmountCommitment = 32,
+    FeeWithdrawal = 64,
+}
+
+impl PauseFlag {
+    /// The single bit owned by this flag.
+    pub const fn bits(self) -> u64 {
+        self as u64
+    }
+
+    /// Every [`PauseFlag`] variant – the source of truth for
+    /// [`set_pause_flags`]' reason map.
+    ///
+    /// The `match` below deliberately has **no catch-all arm**, so adding a
+    /// variant to [`PauseFlag`] without listing it here is a compile error.
+    /// That is the guard against a repeat of `FeeWithdrawal = 64` being
+    /// omitted from the hand-written flag list and silently losing its
+    /// pause-reason audit trail.
+    pub const ALL: [PauseFlag; 7] = {
+        let flags = [
+            PauseFlag::Deposit,
+            PauseFlag::Withdrawal,
+            PauseFlag::Refund,
+            PauseFlag::DepositWithCommitment,
+            PauseFlag::SetPrivacy,
+            PauseFlag::CreateAmountCommitment,
+            PauseFlag::FeeWithdrawal,
+        ];
+        match flags[0] {
+            PauseFlag::Deposit
+            | PauseFlag::Withdrawal
+            | PauseFlag::Refund
+            | PauseFlag::DepositWithCommitment
+            | PauseFlag::SetPrivacy
+            | PauseFlag::CreateAmountCommitment
+            | PauseFlag::FeeWithdrawal => flags,
+        }
+    };
 }
 
 // -----------------------------------------------------------------------------
@@ -123,37 +295,59 @@ pub enum PauseFlag {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-    /// Escrow entry keyed by commitment hash (`Bytes`, typically 32 bytes).
+    /// Legacy escrow entry keyed by commitment hash (`Bytes`, typically 32 bytes).
+    /// Kept for backward-compatible reads after the storage compaction pass.
     Escrow(Bytes),
+    /// Compact escrow payload used for new and rewritten records.
+    EscrowCore(Bytes),
+    /// Optional dispute-only metadata for escrows that actually use arbiters.
+    EscrowDispute(Bytes),
     /// Global escrow counter (singleton).
     EscrowCounter,
     /// Current contract schema version (singleton).
     ContractVersion,
     /// Admin address (singleton).
     Admin,
+    /// Pending, timelocked admin-transfer proposal (singleton). Absent when
+    /// no transfer is currently proposed (Issue #870).
+    PendingAdminProposal,
+    /// Explicit one-time initialization flag (singleton).
+    Initialized,
     /// Paused state (singleton).
     Paused,
     /// Emergency mode (singleton, immutable once set true).
     EmergencyMode,
-    /// Numeric privacy level per account.
+    /// Upgrade window start epoch (u64), in ledger timestamps. 0 = no window set.
+    UpgradeWindowStart,
+    /// Upgrade window end epoch (u64), in ledger timestamps. 0 = no upper bound.
+    UpgradeWindowEnd,
+    /// Flag indicating an upgrade is in progress (between start_upgrade and complete_upgrade).
+    UpgradeInProgress,
+    /// Deprecated numeric privacy level; read-only migration fallback.
     PrivacyLevel(Address),
-    /// Privacy level change history per account.
+    /// Deprecated `enable_privacy` audit history. Not authoritative.
     PrivacyHistory(Address),
     /// Stealth escrow entry keyed by the 32-byte stealth address (Privacy v2).
     StealthEscrow(BytesN<32>),
     /// Granular operation pause bitmask (singleton).
     PauseFlags,
+    /// Reason code for global pause.
+    GlobalPauseReason,
+    /// Reason codes for feature-specific pauses.
+    FeaturePauseReasons,
     /// Fee configuration (singleton).
     FeeConfig,
     /// Platform wallet address for fee collection (singleton).
     PlatformWallet,
     /// Oracle fee configuration for dynamic USD-based fees.
     OracleFeeConfig,
+    /// Cached oracle price with timestamp for staleness guards.
+    CachedOraclePrice,
     /// Registered hook contract addresses.
     HookRegistry,
     /// Reentrancy guard to prevent callback-based reentry during hook execution.
     ReentrancyGuard,
-    /// Boolean privacy flag per account.
+    /// Canonical boolean privacy flag; single source of truth.
     PrivacyEnabled(Address),
     /// 32-byte WASM hash stored at the last `upgrade()` call (singleton).
     WasmHash,
@@ -165,17 +359,177 @@ pub enum DataKey {
     UserRole(Address),
     /// Per-asset fee override keyed by token address (Fee Router v2).
     PerAssetFee(Address),
+    /// Registry of all token addresses with a per-asset fee override (Fee Router v2, singleton).
+    PerAssetFeeRegistry,
     /// Current active fee collector rotation index (Fee Router v2, singleton).
     FeeCollectorIndex,
     /// Fee collector address at a given rotation index (Fee Router v2).
     FeeCollector(u32),
     /// Tracks arbiter votes for disputed escrows. Keyed by (commitment, arbiter).
     DisputeVote(Bytes, Address),
+    /// Tracks whether a hook contract is on the allowlist.
+    HookAllowlist(Address),
+    /// Configurable TTL policy for escrow entries (singleton).
+    /// See [`crate::ttl_policy::TtlConfig`] for the stored type.
+    TtlConfig,
+    /// Registered multi-source oracle addresses (singleton, SC-W8-06).
+    /// See [`crate::oracle::fetch_aggregated_price`].
+    OracleSources,
+    /// Per-source cached oracle price, keyed by source address (SC-W8-06).
+    OracleSourcePrice(Address),
+    /// Multi-source oracle aggregation configuration (singleton, SC-W8-06).
+    OracleAggregationConfig,
+    /// Admin-configurable dispute quorum / vote-TTL policy (singleton).
+    DisputeQuorumConfig,
+    /// Per-dispute frozen quorum snapshot, keyed by commitment.
+    DisputeQuorum(Bytes),
+    /// Accrued, admin-withdrawable protocol fee balance per token. Only ever
+    /// credited when a settlement has no configured collector; never principal.
+    AccruedFees(Address),
 }
 
-// -----------------------------------------------------------------------------
-// Emergency Mode helpers (module scope)
-// -----------------------------------------------------------------------------
+/// Compact escrow record stored on the hot path.
+///
+/// Dispute metadata is intentionally split into a separate record so the common
+/// no-arbiter escrow avoids paying storage rent for empty optional fields.
+#[contracttype]
+#[derive(Clone)]
+struct CompactEscrowEntry {
+    token: Address,
+    amount_due: i128,
+    amount_paid: i128,
+    owner: Address,
+    status: crate::types::EscrowStatus,
+    created_at: u64,
+    expires_at: u64,
+}
+
+impl CompactEscrowEntry {
+    fn from_public(entry: &EscrowEntry) -> Self {
+        Self {
+            token: entry.token.clone(),
+            amount_due: entry.amount_due,
+            amount_paid: entry.amount_paid,
+            owner: entry.owner.clone(),
+            status: entry.status,
+            created_at: entry.created_at,
+            expires_at: entry.expires_at,
+        }
+    }
+
+    fn into_public(self, dispute: EscrowDisputeConfig) -> EscrowEntry {
+        EscrowEntry {
+            token: self.token,
+            amount_due: self.amount_due,
+            amount_paid: self.amount_paid,
+            owner: self.owner,
+            status: self.status,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            arbiter: dispute.arbiter,
+            arbiters: dispute.arbiters,
+            arbiter_threshold: dispute.arbiter_threshold,
+        }
+    }
+}
+
+/// Dispute-only escrow metadata stored separately from the hot-path core record.
+#[contracttype]
+#[derive(Clone)]
+struct EscrowDisputeConfig {
+    arbiter: Option<Address>,
+    arbiters: Vec<Address>,
+    arbiter_threshold: u32,
+}
+
+impl EscrowDisputeConfig {
+    fn empty(env: &Env) -> Self {
+        Self {
+            arbiter: None,
+            arbiters: Vec::new(env),
+            arbiter_threshold: 0,
+        }
+    }
+
+    fn from_public(env: &Env, entry: &EscrowEntry) -> Self {
+        Self {
+            arbiter: entry.arbiter.clone(),
+            arbiters: if entry.arbiters.is_empty() {
+                Vec::new(env)
+            } else {
+                entry.arbiters.clone()
+            },
+            arbiter_threshold: entry.arbiter_threshold,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.arbiter.is_none() && self.arbiters.is_empty() && self.arbiter_threshold == 0
+    }
+}
+
+fn legacy_escrow_key(commitment: &Bytes) -> DataKey {
+    DataKey::Escrow(commitment.clone())
+}
+
+fn compact_escrow_key(commitment: &Bytes) -> DataKey {
+    DataKey::EscrowCore(commitment.clone())
+}
+
+fn escrow_dispute_key(commitment: &Bytes) -> DataKey {
+    DataKey::EscrowDispute(commitment.clone())
+}
+
+fn get_escrow_dispute_config(env: &Env, commitment: &Bytes) -> EscrowDisputeConfig {
+    let key = escrow_dispute_key(commitment);
+    let dispute = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| EscrowDisputeConfig::empty(env));
+
+    if !dispute.is_empty() {
+        set_or_extend_ttl(env, &key, RecordType::EscrowDispute);
+    }
+
+    dispute
+}
+
+fn put_escrow_dispute_config(env: &Env, commitment: &Bytes, entry: &EscrowEntry) {
+    let key = escrow_dispute_key(commitment);
+    let dispute = EscrowDisputeConfig::from_public(env, entry);
+
+    if dispute.is_empty() {
+        env.storage().persistent().remove(&key);
+        return;
+    }
+
+    env.storage().persistent().set(&key, &dispute);
+    set_or_extend_ttl(env, &key, RecordType::EscrowDispute);
+}
+
+#[allow(dead_code)]
+fn extend_escrow_compaction_ttl(env: &Env, commitment: &Bytes) -> bool {
+    let core_key = compact_escrow_key(commitment);
+    if env.storage().persistent().has(&core_key) {
+        set_or_extend_ttl(env, &core_key, RecordType::Escrow);
+
+        let dispute_key = escrow_dispute_key(commitment);
+        if env.storage().persistent().has(&dispute_key) {
+            set_or_extend_ttl(env, &dispute_key, RecordType::EscrowDispute);
+        }
+
+        return true;
+    }
+
+    let legacy_key = legacy_escrow_key(commitment);
+    if env.storage().persistent().has(&legacy_key) {
+        set_or_extend_ttl(env, &legacy_key, RecordType::Escrow);
+        return true;
+    }
+
+    false
+}
 /// Set emergency mode. Once set to true, cannot be reverted.
 pub fn set_emergency_mode(env: &Env) {
     let key = DataKey::EmergencyMode;
@@ -192,6 +546,177 @@ pub fn is_emergency_mode(env: &Env) -> bool {
     env.storage().persistent().get(&key).unwrap_or(false)
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Upgrade Window helpers (Issue #432)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Set the upgrade window: [start, end] in ledger seconds (epoch).
+/// - `start`: ledger timestamp when upgrades are allowed to begin. 0 = unset.
+/// - `end`: ledger timestamp after which upgrades are blocked. 0 = no upper bound.
+pub fn set_upgrade_window(env: &Env, start: u64, end: u64) {
+    if end != 0 && end <= start {
+        // Invalid window; silently ignore or could panic depending on caller behavior
+        return;
+    }
+    env.storage()
+        .persistent()
+        .set(&DataKey::UpgradeWindowStart, &start);
+    env.storage()
+        .persistent()
+        .set(&DataKey::UpgradeWindowEnd, &end);
+}
+
+/// Get the current upgrade window.
+pub fn get_upgrade_window(env: &Env) -> (u64, u64) {
+    let start = env
+        .storage()
+        .persistent()
+        .get(&DataKey::UpgradeWindowStart)
+        .unwrap_or(0u64);
+    let end = env
+        .storage()
+        .persistent()
+        .get(&DataKey::UpgradeWindowEnd)
+        .unwrap_or(0u64);
+    (start, end)
+}
+
+/// Check if upgrade window is currently active.
+pub fn is_upgrade_window_active(env: &Env) -> bool {
+    let (start, end) = get_upgrade_window(env);
+    if start == 0 {
+        return false; // No window set
+    }
+    let now = env.ledger().timestamp();
+    now >= start && (end == 0 || now <= end)
+}
+
+/// Set upgrade-in-progress flag.
+pub fn set_upgrade_in_progress(env: &Env, in_progress: bool) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::UpgradeInProgress, &in_progress);
+}
+
+/// Get upgrade-in-progress flag.
+pub fn is_upgrade_in_progress(env: &Env) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UpgradeInProgress)
+        .unwrap_or(false)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Invariant Checking (Issue #432)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Assert critical post-upgrade invariants.
+///
+/// Called after migration to validate state machine and fee bounds.
+/// Returns `Ok(())` if all invariants hold; `Err(msg)` deterministically if violated.
+///
+/// ## Checked invariants
+///
+/// | # | Invariant                                       | Gap filled by this PR |
+/// |---|-------------------------------------------------|-----------------------|
+/// | 1 | Global `fee_bps` within `[0, MAX_FEE_BPS]`     | pre-existing          |
+/// | 2 | Contract version equals `CURRENT`              | pre-existing          |
+/// | 3 | Admin address is set                           | pre-existing          |
+/// | 4 | `TtlPolicy` bounds valid for all record types  | **new (Issue #1173)**  |
+/// | 5 | `DisputeQuorumConfig` bounds (if configured)   | **new (Issue #1173)**  |
+/// | 6 | `OracleAggregationConfig` bounds (if configured) | **new (Issue #1173)** |
+/// | 7 | `OracleFeeConfig` active config bounds         | **new (Issue #1173)**  |
+/// | 8 | Per-asset fees in registry within `[0, MAX_FEE_BPS]` | **new (Issue #1173)** |
+///
+/// ## Per-asset fee decision (Issue #1173 AC3)
+///
+/// Per-asset fees are now tracked via a `PerAssetFeeRegistry` (`Vec<Address>`) stored
+/// under [`DataKey::PerAssetFeeRegistry`]. Every call to `set_per_asset_fee` must
+/// register the token in this list so this invariant can iterate and validate all
+/// configured tokens. The registry is append-only and deduplicated at write time.
+pub fn assert_post_upgrade_invariants(env: &Env) -> Result<(), &'static str> {
+    // Invariant 1: Global fee bounds must be within [0, MAX_FEE_BPS] basis points.
+    let fee_cfg = get_fee_config(env);
+    if fee_cfg.fee_bps > crate::fee::MAX_FEE_BPS {
+        return Err("fee_bps exceeds maximum (10000)");
+    }
+
+    // Invariant 2: Contract version must be set to CURRENT.
+    let version = get_contract_version(env);
+    if version != Some(CURRENT_CONTRACT_VERSION) {
+        return Err("contract version not set to current after migration");
+    }
+
+    // Invariant 3: Admin must be initialized.
+    if get_admin(env).is_none() {
+        return Err("admin not initialized post-upgrade");
+    }
+
+    // Invariant 4: TtlPolicy bounds must be valid for every record type.
+    // The TTL policy is computed inline (not stored), so we validate the known
+    // constants that drive it. This catches any future misconfiguration if
+    // LEDGER_THRESHOLD or SIX_MONTHS_IN_LEDGERS are edited incorrectly.
+    let record_types = [
+        RecordType::Escrow,
+        RecordType::EscrowDispute,
+        RecordType::FeeConfig,
+        RecordType::StealthEscrow,
+        RecordType::EscrowIdMap,
+    ];
+    for rt in record_types {
+        let policy = get_ttl_policy(rt);
+        policy.validate()?;
+    }
+
+    // Invariant 5: DisputeQuorumConfig bounds (if the singleton has been stored).
+    if let Some(qcfg) = get_dispute_quorum_config(env) {
+        qcfg.validate()?;
+    }
+
+    // Invariant 6: OracleAggregationConfig bounds (always has a value due to defaults).
+    {
+        let oac = get_oracle_aggregation_config(env);
+        if oac.min_sources == 0 {
+            return Err("OracleAggregationConfig: min_sources must be >= 1");
+        }
+        if oac.max_deviation_bps > 10_000 {
+            return Err("OracleAggregationConfig: max_deviation_bps must be <= 10_000 (100%)");
+        }
+    }
+
+    // Invariant 7: Active OracleFeeConfig bounds (if the oracle pricing is configured).
+    if let Some(oracle_cfg) = get_oracle_fee_config(env) {
+        if oracle_cfg.usd_fee_micros <= 0 {
+            return Err("OracleFeeConfig: usd_fee_micros must be > 0");
+        }
+        if oracle_cfg.usd_fee_micros > OracleAggregationConfig::HARD_MAX_USD_FEE_MICROS {
+            return Err("OracleFeeConfig: usd_fee_micros exceeds hard maximum");
+        }
+        if oracle_cfg.stale_threshold_secs == 0 {
+            return Err("OracleFeeConfig: stale_threshold_secs must be > 0");
+        }
+        if oracle_cfg.stale_threshold_secs > OracleAggregationConfig::HARD_MAX_STALE_SECS {
+            return Err("OracleFeeConfig: stale_threshold_secs exceeds 7-day limit");
+        }
+    }
+
+    // Invariant 8: Per-asset fee registry — iterate all configured tokens and
+    // validate fee_bps and arbiter_bps for each.
+    let registry = get_per_asset_fee_registry(env);
+    for token in registry.iter() {
+        if let Some(asset_cfg) = get_per_asset_fee(env, &token) {
+            if asset_cfg.fee_bps > crate::fee::MAX_FEE_BPS {
+                return Err("per-asset fee_bps exceeds maximum (10000)");
+            }
+            if asset_cfg.arbiter_bps > crate::fee::MAX_FEE_BPS {
+                return Err("per-asset arbiter_bps exceeds maximum (10000)");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // -----------------------------------------------------------------------------
 // Escrow helpers
 // -----------------------------------------------------------------------------
@@ -201,39 +726,103 @@ pub fn is_emergency_mode(env: &Env) -> bool {
 /// **Contract**: Overwrites any existing entry for the same commitment.
 /// The commitment should be the 32-byte `SHA256(owner || amount || salt)` hash.
 pub fn put_escrow(env: &Env, commitment: &Bytes, entry: &EscrowEntry) {
-    let key = DataKey::Escrow(commitment.clone());
-    env.storage().persistent().set(&key, entry);
-    set_or_extend_ttl(env, &key, RecordType::Escrow);
+    let compact_key = compact_escrow_key(commitment);
+    let compact_entry = CompactEscrowEntry::from_public(entry);
+
+    env.storage().persistent().set(&compact_key, &compact_entry);
+    set_or_extend_ttl(env, &compact_key, RecordType::Escrow);
+    put_escrow_dispute_config(env, commitment, entry);
+
+    // Lazy migration: once an escrow is rewritten, retire the legacy payload.
+    env.storage()
+        .persistent()
+        .remove(&legacy_escrow_key(commitment));
 }
 
 /// Remove an escrow entry from storage and reclaim the storage deposit.
 pub fn remove_escrow(env: &Env, commitment: &Bytes) {
-    let key = DataKey::Escrow(commitment.clone());
-    env.storage().persistent().remove(&key);
+    env.storage()
+        .persistent()
+        .remove(&compact_escrow_key(commitment));
+    env.storage()
+        .persistent()
+        .remove(&escrow_dispute_key(commitment));
+    env.storage()
+        .persistent()
+        .remove(&legacy_escrow_key(commitment));
 }
 
 /// Get an escrow entry from storage.
 ///
 /// **Contract**: Returns `None` if no escrow exists for the commitment.
 pub fn get_escrow(env: &Env, commitment: &Bytes) -> Option<EscrowEntry> {
-    let key = DataKey::Escrow(commitment.clone());
-    let result = env.storage().persistent().get(&key);
-    if result.is_some() {
-        set_or_extend_ttl(env, &key, RecordType::Escrow);
+    let compact_key = compact_escrow_key(commitment);
+    let compact_result: Option<CompactEscrowEntry> = env.storage().persistent().get(&compact_key);
+    if let Some(compact_entry) = compact_result {
+        set_or_extend_ttl(env, &compact_key, RecordType::Escrow);
+        let dispute = get_escrow_dispute_config(env, commitment);
+        return Some(compact_entry.into_public(dispute));
     }
-    result
+
+    let legacy_key = legacy_escrow_key(commitment);
+    let legacy_result: Option<EscrowEntry> = env.storage().persistent().get(&legacy_key);
+    if legacy_result.is_some() {
+        set_or_extend_ttl(env, &legacy_key, RecordType::Escrow);
+    }
+    legacy_result
 }
 
 /// Check if an escrow entry exists in storage.
 #[allow(dead_code)]
 pub fn has_escrow(env: &Env, commitment: &Bytes) -> bool {
-    let key = DataKey::Escrow(commitment.clone());
-    env.storage().persistent().has(&key)
+    env.storage()
+        .persistent()
+        .has(&compact_escrow_key(commitment))
+        || env
+            .storage()
+            .persistent()
+            .has(&legacy_escrow_key(commitment))
+}
+
+/// Extend the TTL of whichever escrow representation is currently stored.
+/// Used by `ttl_policy` module for the policy-neutral baseline bump.
+#[allow(dead_code)]
+pub fn extend_escrow_storage_ttl(env: &Env, commitment: &Bytes) -> bool {
+    extend_escrow_compaction_ttl(env, commitment)
+}
+
+#[cfg(test)]
+pub(crate) fn legacy_escrow_storage_footprint_bytes(
+    env: &Env,
+    commitment: &Bytes,
+    entry: &EscrowEntry,
+) -> usize {
+    (legacy_escrow_key(commitment).to_xdr(env).len() + entry.to_xdr(env).len()) as usize
+}
+
+#[cfg(test)]
+pub(crate) fn compact_escrow_storage_footprint_bytes(
+    env: &Env,
+    commitment: &Bytes,
+    entry: &EscrowEntry,
+) -> usize {
+    let compact_key = compact_escrow_key(commitment);
+    let compact_entry = CompactEscrowEntry::from_public(entry);
+    let mut total = compact_key.to_xdr(env).len() + compact_entry.to_xdr(env).len();
+
+    let dispute = EscrowDisputeConfig::from_public(env, entry);
+    if !dispute.is_empty() {
+        total += escrow_dispute_key(commitment).to_xdr(env).len() + dispute.to_xdr(env).len();
+    }
+
+    total as usize
 }
 
 /// Get the next escrow counter value.
 ///
-/// **Contract**: Returns 0 if never set. Counter is used for `create_escrow`.
+/// **Contract**: Returns 0 if never set. Checked as a post-upgrade invariant
+/// (see `validate_upgrade_invariants`); no contract entrypoint reads it
+/// directly (the `create_escrow` stub that once did was removed — SC-W8-02).
 #[allow(dead_code)]
 pub fn get_escrow_counter(env: &Env) -> u64 {
     let key = DataKey::EscrowCounter;
@@ -242,7 +831,10 @@ pub fn get_escrow_counter(env: &Env) -> u64 {
 
 /// Increment and return the escrow counter.
 ///
-/// **Contract**: Atomic increment. Initial value treated as 0.
+/// **Contract**: Atomic increment. Initial value treated as 0. No contract
+/// entrypoint calls this anymore (the `create_escrow` stub that once did was
+/// removed — SC-W8-02); kept for storage-migration test coverage.
+#[allow(dead_code)]
 pub fn increment_escrow_counter(env: &Env) -> u64 {
     let key = DataKey::EscrowCounter;
     let mut count: u64 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -259,6 +851,21 @@ pub fn set_contract_version(env: &Env, version: u32) {
     env.storage()
         .persistent()
         .set(&DataKey::ContractVersion, &version);
+}
+
+/// Returns true only after a successful one-time contract initialization.
+pub fn is_initialized(env: &Env) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Initialized)
+        .unwrap_or(false)
+}
+
+/// Mark contract as initialized.
+pub fn set_initialized(env: &Env, initialized: bool) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::Initialized, &initialized);
 }
 
 pub fn get_wasm_hash(env: &Env) -> Option<BytesN<32>> {
@@ -287,6 +894,32 @@ pub fn get_admin(env: &Env) -> Option<Address> {
     env.storage().persistent().get(&key)
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Timelocked Admin Transfer helpers (Issue #870)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Get the currently pending admin-transfer proposal, if any.
+pub fn get_pending_admin_proposal(env: &Env) -> Option<PendingAdminProposal> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PendingAdminProposal)
+}
+
+/// Store a new (or overwrite the existing) pending admin-transfer proposal.
+pub fn set_pending_admin_proposal(env: &Env, proposal: &PendingAdminProposal) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::PendingAdminProposal, proposal);
+}
+
+/// Clear any pending admin-transfer proposal (on accept or cancel).
+pub fn clear_pending_admin_proposal(env: &Env) {
+    let key = DataKey::PendingAdminProposal;
+    if env.storage().persistent().has(&key) {
+        env.storage().persistent().remove(&key);
+    }
+}
+
 // -----------------------------------------------------------------------------
 // TTL Helper
 // -----------------------------------------------------------------------------
@@ -301,24 +934,79 @@ pub fn set_or_extend_ttl(env: &Env, key: &DataKey, record_type: RecordType) {
 
 /// Set paused state.
 #[allow(dead_code)]
-pub fn set_paused(env: &Env, paused: bool) {
+pub fn set_paused(env: &Env, paused: bool, reason: u32) {
     let key = DataKey::Paused;
     env.storage().persistent().set(&key, &paused);
+
+    let reason_key = DataKey::GlobalPauseReason;
+    if paused {
+        env.storage().persistent().set(&reason_key, &reason);
+    } else {
+        env.storage().persistent().set(&reason_key, &0u32);
+    }
+}
+
+/// Get global pause reason code.
+pub fn get_global_pause_reason(env: &Env) -> u32 {
+    let key = DataKey::GlobalPauseReason;
+    env.storage().persistent().get(&key).unwrap_or(0u32)
 }
 
 /// Set pause flags (granular pause control – caller already verified by admin module).
-pub fn set_pause_flags(env: &Env, _caller: &Address, flags_to_enable: u64, flags_to_disable: u64) {
+pub fn set_pause_flags(
+    env: &Env,
+    _caller: &Address,
+    flags_to_enable: u64,
+    flags_to_disable: u64,
+    reason: u32,
+) {
     let key = DataKey::PauseFlags;
     let current: u64 = env.storage().persistent().get(&key).unwrap_or(0);
     let updated = (current | flags_to_enable) & !flags_to_disable;
     env.storage().persistent().set(&key, &updated);
+
+    let reasons_key = DataKey::FeaturePauseReasons;
+    let mut reasons: Map<u32, u32> = env
+        .storage()
+        .persistent()
+        .get(&reasons_key)
+        .unwrap_or_else(|| Map::new(env));
+
+    // Derived from `PauseFlag::ALL` instead of a hand-written list. The old
+    // hardcoded `[1, 2, 4, 8, 16, 32]` predated `FeeWithdrawal = 64`, so a
+    // fee-withdrawal pause set the bitmask but never recorded its reason.
+    for flag in PauseFlag::ALL {
+        let bit = flag.bits();
+        if (flags_to_enable & bit) != 0 {
+            reasons.set(flag as u32, reason);
+        }
+        if (flags_to_disable & bit) != 0 {
+            reasons.remove(flag as u32);
+        }
+    }
+    env.storage().persistent().set(&reasons_key, &reasons);
+}
+
+/// Read the current granular pause flag bitmask.
+pub fn get_pause_flags(env: &Env) -> u64 {
+    let key = DataKey::PauseFlags;
+    env.storage().persistent().get(&key).unwrap_or(0)
 }
 
 /// Check whether a specific operation flag is paused.
 pub fn is_feature_paused(env: &Env, flag: PauseFlag) -> bool {
-    let key = DataKey::PauseFlags;
-    let flags: u64 = env.storage().persistent().get(&key).unwrap_or(0);
-    flags & (flag as u64) != 0
+    get_pause_flags(env) & (flag as u64) != 0
+}
+
+/// Get the reason a specific feature was paused.
+pub fn get_feature_pause_reason(env: &Env, flag: PauseFlag) -> u32 {
+    let key = DataKey::FeaturePauseReasons;
+    let reasons: Map<u32, u32> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Map::new(env));
+    reasons.get(flag as u32).unwrap_or(0u32)
 }
 
 /// Get paused state.
@@ -329,25 +1017,43 @@ pub fn is_paused(env: &Env) -> bool {
 }
 
 // -----------------------------------------------------------------------------
-// Privacy helpers (level-based API)
+// Privacy helpers (deprecated level-based API; see `crate::privacy` for the
+// canonical boolean state consolidated under Issue #862 / SC-W8-01)
 // -----------------------------------------------------------------------------
 
-/// Set privacy level for an account.
-pub fn set_privacy_level(env: &Env, account: &Address, level: u32) {
-    let key = DataKey::PrivacyLevel(account.clone());
-    env.storage().persistent().set(&key, &level);
-}
-
-/// Get privacy level for an account.
+/// Get the deprecated numeric privacy level for an account, if ever set.
+///
+/// Read-only migration fallback; new writes no longer go through this key.
 pub fn get_privacy_level(env: &Env, account: &Address) -> Option<u32> {
     let key = DataKey::PrivacyLevel(account.clone());
     env.storage().persistent().get(&key)
 }
 
-/// Add to privacy history for an account.
+/// Remove the deprecated numeric privacy level for an account, if present.
+///
+/// Called once the account's state has been written through the canonical
+/// [`crate::privacy`] API, so future reads can never fall back to stale data.
+pub fn clear_privacy_level(env: &Env, account: &Address) {
+    let key = DataKey::PrivacyLevel(account.clone());
+    if env.storage().persistent().has(&key) {
+        env.storage().persistent().remove(&key);
+    }
+}
+
+/// Maximum retained entries in the deprecated privacy history (newest first).
+///
+/// Keeping the existing `Vec<u32>` layout avoids a storage-key migration. Both
+/// reads and writes are capped so old oversized records cannot produce an
+/// unbounded entrypoint return value. Canonical privacy state is independent.
+pub const MAX_PRIVACY_HISTORY: u32 = 64;
+
+/// Add to the deprecated `enable_privacy` audit history for an account.
 ///
 /// **Contract**: Pushes `level` to the front of the history (newest first).
-/// History is unbounded; consider capping in future if needed.
+/// Retains at most [`MAX_PRIVACY_HISTORY`] (64) entries, discarding the oldest.
+/// Legacy oversized records are compacted on their next successful append.
+/// This log does not itself determine canonical privacy state; see
+/// [`crate::privacy`].
 pub fn add_privacy_history(env: &Env, account: &Address, level: u32) {
     let key = DataKey::PrivacyHistory(account.clone());
     let mut history: Vec<u32> = env
@@ -355,19 +1061,32 @@ pub fn add_privacy_history(env: &Env, account: &Address, level: u32) {
         .persistent()
         .get(&key)
         .unwrap_or(Vec::new(env));
+    // Retain only the newest prefix before appending. Work is bounded by the
+    // cap rather than looping over every discarded legacy entry.
+    if history.len() >= MAX_PRIVACY_HISTORY {
+        history = history.slice(..MAX_PRIVACY_HISTORY - 1);
+    }
     history.push_front(level);
     env.storage().persistent().set(&key, &history);
 }
 
 /// Get privacy history for an account.
 ///
-/// **Contract**: Returns empty vec if never set. Order is newest-first.
+/// **Contract**: Returns empty vec if never set, otherwise at most 64 entries
+/// in newest-first order. Legacy oversized values are bounded without writing
+/// storage during a read; their next successful append compacts the record.
 pub fn get_privacy_history(env: &Env, account: &Address) -> Vec<u32> {
     let key = DataKey::PrivacyHistory(account.clone());
-    env.storage()
+    let history: Vec<u32> = env
+        .storage()
         .persistent()
         .get(&key)
-        .unwrap_or(Vec::new(env))
+        .unwrap_or(Vec::new(env));
+    if history.len() > MAX_PRIVACY_HISTORY {
+        history.slice(..MAX_PRIVACY_HISTORY)
+    } else {
+        history
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -399,6 +1118,48 @@ pub fn set_platform_wallet(env: &Env, wallet: &Address) {
         .set(&DataKey::PlatformWallet, wallet);
 }
 
+// -----------------------------------------------------------------------------
+// Accrued fee treasury (Issue #866 / SC-W8-05)
+// -----------------------------------------------------------------------------
+
+/// Get the accrued, admin-withdrawable protocol fee balance for `token`.
+///
+/// Defaults to `0` if the token has never accrued an un-forwarded fee.
+pub fn get_accrued_fee_balance(env: &Env, token: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AccruedFees(token.clone()))
+        .unwrap_or(0)
+}
+
+/// Credit `amount` to `token`'s accrued fee balance.
+///
+/// Called only from `fee_router` when a settlement's platform-fee portion
+/// has no configured collector to forward to; never from escrow principal.
+pub fn add_accrued_fee(env: &Env, token: &Address, amount: i128) {
+    let key = DataKey::AccruedFees(token.clone());
+    let current = get_accrued_fee_balance(env, token);
+    env.storage()
+        .persistent()
+        .set(&key, &current.saturating_add(amount));
+    set_or_extend_ttl(env, &key, RecordType::FeeConfig);
+}
+
+/// Debit `amount` from `token`'s accrued fee balance.
+///
+/// # Errors
+/// - [`QuickexError::Overpayment`] – `amount` exceeds the current accrued balance.
+pub fn subtract_accrued_fee(env: &Env, token: &Address, amount: i128) -> Result<(), QuickexError> {
+    let key = DataKey::AccruedFees(token.clone());
+    let current = get_accrued_fee_balance(env, token);
+    if amount > current {
+        return Err(QuickexError::Overpayment);
+    }
+    env.storage().persistent().set(&key, &(current - amount));
+    set_or_extend_ttl(env, &key, RecordType::FeeConfig);
+    Ok(())
+}
+
 pub fn get_oracle_fee_config(env: &Env) -> Option<crate::types::OracleFeeConfig> {
     env.storage().persistent().get(&DataKey::OracleFeeConfig)
 }
@@ -407,6 +1168,89 @@ pub fn set_oracle_fee_config(env: &Env, config: &crate::types::OracleFeeConfig) 
     env.storage()
         .persistent()
         .set(&DataKey::OracleFeeConfig, config);
+}
+
+/// Get the cached oracle price record (price + timestamp).
+pub fn get_cached_oracle_price(env: &Env) -> Option<CachedOraclePrice> {
+    env.storage().persistent().get(&DataKey::CachedOraclePrice)
+}
+
+/// Set the cached oracle price record. Called when the oracle delivers a fresh price.
+pub fn set_cached_oracle_price(env: &Env, price: &CachedOraclePrice) {
+    let key = DataKey::CachedOraclePrice;
+    env.storage().persistent().set(&key, price);
+    set_or_extend_ttl(env, &key, RecordType::FeeConfig);
+}
+
+// -----------------------------------------------------------------------------
+// Multi-source oracle aggregation (SC-W8-06 / Issue #867)
+// -----------------------------------------------------------------------------
+
+/// Get the list of registered oracle source addresses. Empty if none registered.
+pub fn get_oracle_sources(env: &Env) -> Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::OracleSources)
+        .unwrap_or(Vec::new(env))
+}
+
+/// Set the list of registered oracle source addresses.
+pub fn set_oracle_sources(env: &Env, sources: &Vec<Address>) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::OracleSources, sources);
+}
+
+/// Get the cached price record for a specific oracle source.
+pub fn get_oracle_source_price(env: &Env, source: &Address) -> Option<CachedOraclePrice> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::OracleSourcePrice(source.clone()))
+}
+
+/// Set the cached price record for a specific oracle source. Called when
+/// that source pushes a fresh price via `record_oracle_source_price`.
+pub fn set_oracle_source_price(env: &Env, source: &Address, price: &CachedOraclePrice) {
+    let key = DataKey::OracleSourcePrice(source.clone());
+    env.storage().persistent().set(&key, price);
+    set_or_extend_ttl(env, &key, RecordType::FeeConfig);
+}
+
+/// Get the multi-source oracle aggregation configuration.
+///
+/// Defaults to `{ min_sources: 1, max_deviation_bps: 10_000 }` (any single
+/// fresh registered source suffices, no deviation filtering) when never
+/// explicitly configured, so registering sources works out of the box
+/// before an admin tunes the policy.
+pub fn get_oracle_aggregation_config(env: &Env) -> crate::types::OracleAggregationConfig {
+    env.storage()
+        .persistent()
+        .get(&DataKey::OracleAggregationConfig)
+        .unwrap_or(crate::types::OracleAggregationConfig {
+            min_sources: 1,
+            max_deviation_bps: 10_000,
+        })
+}
+
+/// Set the multi-source oracle aggregation configuration.
+pub fn set_oracle_aggregation_config(env: &Env, config: &crate::types::OracleAggregationConfig) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::OracleAggregationConfig, config);
+}
+
+pub fn is_hook_allowed(env: &Env, hook_contract: &Address) -> bool {
+    let key = DataKey::HookAllowlist(hook_contract.clone());
+    env.storage().persistent().get(&key).unwrap_or(false)
+}
+
+pub fn set_hook_allowed(env: &Env, hook_contract: &Address, allowed: bool) {
+    let key = DataKey::HookAllowlist(hook_contract.clone());
+    if allowed {
+        env.storage().persistent().set(&key, &true);
+    } else {
+        env.storage().persistent().remove(&key);
+    }
 }
 
 pub fn get_registered_hooks(env: &Env) -> Vec<Address> {
@@ -489,10 +1333,58 @@ pub fn get_per_asset_fee(env: &Env, token: &Address) -> Option<crate::types::Per
 }
 
 /// Set per-asset fee config for `token`.
+///
+/// Also registers `token` in the [`DataKey::PerAssetFeeRegistry`] so that
+/// [`assert_post_upgrade_invariants`] can iterate and validate all configured
+/// per-asset fees.  The registry is deduplicated: tokens already present are
+/// not added again.
 pub fn set_per_asset_fee(env: &Env, token: &Address, config: &crate::types::PerAssetFeeConfig) {
     let key = DataKey::PerAssetFee(token.clone());
     env.storage().persistent().set(&key, config);
+    // Register token in the per-asset fee registry (append-only, deduplicated).
+    let mut registry = get_per_asset_fee_registry(env);
+    if !registry.contains(token.clone()) {
+        registry.push_back(token.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::PerAssetFeeRegistry, &registry);
+    }
 }
+
+/// Get the list of all token addresses that have a per-asset fee override.
+pub fn get_per_asset_fee_registry(env: &Env) -> Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PerAssetFeeRegistry)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+// -----------------------------------------------------------------------------
+// DisputeQuorumConfig helpers (Issue #1173)
+// -----------------------------------------------------------------------------
+
+/// Get the global dispute quorum configuration (if set).
+pub fn get_dispute_quorum_config(env: &Env) -> Option<DisputeQuorumConfig> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::DisputeQuorumConfig)
+}
+
+/// Set the global dispute quorum configuration.
+///
+/// **Validation**: callers should call `config.validate()` before storing.
+#[allow(dead_code)]
+pub fn set_dispute_quorum_config(env: &Env, config: &DisputeQuorumConfig) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::DisputeQuorumConfig, config);
+}
+
+// -----------------------------------------------------------------------------
+// OracleAggregationConfig helpers (Issue #1173)
+// (get_oracle_aggregation_config / set_oracle_aggregation_config are defined
+// earlier in this file as the canonical multi-source oracle helpers)
+// -----------------------------------------------------------------------------
 
 /// Get current fee collector rotation index (default 0).
 pub fn get_fee_collector_index(env: &Env) -> u32 {
@@ -570,12 +1462,24 @@ pub fn has_dispute_vote(env: &Env, commitment: &Bytes, arbiter: &Address) -> boo
     env.storage().persistent().has(&key)
 }
 
-/// Count the number of votes for a disputed escrow.
-pub fn count_dispute_votes(env: &Env, commitment: &Bytes, arbiters: &Vec<Address>) -> u32 {
+/// Count the number of *fresh* votes for a disputed escrow (Issue #865 / SC-W8-04).
+///
+/// A vote only counts toward quorum while `now <= voted_at + vote_ttl_secs`;
+/// a stale vote is silently excluded rather than treated as an error, so a
+/// slow-moving dispute cannot be resolved on long-expired opinions.
+pub fn count_dispute_votes(
+    env: &Env,
+    commitment: &Bytes,
+    arbiters: &Vec<Address>,
+    vote_ttl_secs: u64,
+) -> u32 {
+    let now = env.ledger().timestamp();
     let mut count = 0;
     for arbiter in arbiters.iter() {
-        if has_dispute_vote(env, commitment, &arbiter) {
-            count += 1;
+        if let Some(vote) = get_dispute_vote(env, commitment, &arbiter) {
+            if now <= vote.voted_at.saturating_add(vote_ttl_secs) {
+                count += 1;
+            }
         }
     }
     count

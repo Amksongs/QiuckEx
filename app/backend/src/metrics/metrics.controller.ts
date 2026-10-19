@@ -7,14 +7,16 @@ import {
 import { ApiOperation, ApiResponse, ApiTags } from "@nestjs/swagger";
 import { MetricsService } from "./metrics.service";
 import { MetricsGuard } from "./metrics.guard";
+import { RateLimitTier } from "../auth/decorators/rate-limit-group.decorator";
 
 @ApiTags("metrics")
+@UseGuards(MetricsGuard)
 @Controller("metrics")
 export class MetricsController {
   constructor(private metricsService: MetricsService) {}
 
   @Get()
-  @UseGuards(MetricsGuard)
+  @RateLimitTier("public-read")
   @ApiOperation({
     summary: "Get Prometheus metrics",
     description:
@@ -53,6 +55,7 @@ export class MetricsController {
   }
 
   @Get("content-type")
+  @RateLimitTier("public-read")
   @ApiOperation({
     summary: "Get metrics content type",
     description: "Returns the content type for the Prometheus metrics.",

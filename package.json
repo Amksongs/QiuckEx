@@ -7,7 +7,11 @@
     "build": "turbo run build",
     "lint": "turbo run lint",
     "type-check": "turbo run type-check",
-    "test": "turbo run test"
+    "test": "turbo run test",
+    "secret-scan": "bash scripts/secret-scan.sh",
+    "secret-scan:verify": "bash scripts/secret-scan.sh --verify",
+    "secret-scan:full": "bash scripts/secret-scan.sh --full",
+    "api-client:generate": "pnpm --filter @quickex/api-client regenerate"
   },
   "devDependencies": {
     "turbo": "^2.3.3",
@@ -20,7 +24,6 @@
   },
   "dependencies": {
     "node-fetch": "2",
-    "pnpm": "^10.30.1",
     "stellar-sdk": "^13.3.0",
     "toml": "^3.0.0"
   }

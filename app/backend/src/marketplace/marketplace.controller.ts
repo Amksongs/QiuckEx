@@ -21,7 +21,15 @@ import {
 } from '@nestjs/swagger';
 
 import { MarketplaceService } from './marketplace.service';
-import { ListUsernameDto, PlaceBidDto, AcceptBidDto, CancelListingDto } from './dto';
+import { RateLimitTier } from '../auth/decorators/rate-limit-group.decorator';
+import {
+  ListUsernameDto,
+  PlaceBidDto,
+  AcceptBidDto,
+  CancelListingDto,
+  MarketplaceListingDetailDto,
+  GetMarketplaceListingsDto,
+} from './dto';
 import { MarketplaceError, MarketplaceErrorCode } from './errors';
 
 @ApiTags('marketplace')
@@ -30,6 +38,7 @@ export class MarketplaceController {
   constructor(private readonly marketplaceService: MarketplaceService) {}
 
   @Post('list')
+  @RateLimitTier('mutation')
   @ApiOperation({ summary: 'List a username for sale' })
   @ApiBody({ type: ListUsernameDto })
   @ApiResponse({ status: 201, description: 'Listing created' })
@@ -53,27 +62,58 @@ export class MarketplaceController {
   }
 
   @Get()
-  @ApiOperation({ summary: 'Get all active listings' })
+  @RateLimitTier('search')
+  @ApiOperation({ summary: 'Get active listings with sort, filter, and pagination' })
   @ApiQuery({ name: 'limit', required: false, example: 20, description: 'Items per page (1-100)' })
   @ApiQuery({ name: 'cursor', required: false, description: 'Opaque pagination cursor' })
-  @ApiResponse({ status: 200, description: 'List of active listings' })
-  async getActiveListings(
-    @Query('limit') limit = 20,
-    @Query('cursor') cursor?: string,
-  ) {
-    const result = await this.marketplaceService.getActiveListings(
-      Number(limit),
-      cursor ?? null,
-    );
-    return {
-      listings: result.listings,
-      total: result.total,
-      next_cursor: result.next_cursor,
-      has_more: result.has_more,
-    };
+  @ApiQuery({ name: 'sort', required: false, enum: ['newest', 'ending_soon', 'price_asc', 'price_desc'] })
+  @ApiQuery({ name: 'min_price', required: false, description: 'Minimum asking price (inclusive)' })
+  @ApiQuery({ name: 'max_price', required: false, description: 'Maximum asking price (inclusive)' })
+  @ApiQuery({ name: 'username', required: false, description: 'Filter by username substring' })
+  @ApiResponse({ status: 200, description: 'List of active listings with bid summary data' })
+  @ApiResponse({ status: 400, description: 'Invalid sort, filter, or pagination parameters' })
+  async getActiveListings(@Query() query: GetMarketplaceListingsDto) {
+    try {
+      return await this.marketplaceService.queryListings(query);
+    } catch (err) {
+      if (err instanceof MarketplaceError) {
+        this.throwHttp(err);
+      }
+      throw err;
+    }
+  }
+
+  @Get(':listingId/detail')
+  @RateLimitTier('public-read')
+  @ApiOperation({ summary: 'Get listing detail with bids and action hints' })
+  @ApiParam({ name: 'listingId', description: 'Listing UUID' })
+  @ApiQuery({
+    name: 'viewerPublicKey',
+    required: false,
+    description: 'Optional viewer wallet for bid eligibility hints',
+  })
+  @ApiResponse({ status: 200, description: 'Listing detail payload' })
+  @ApiResponse({ status: 404, description: 'Listing not found' })
+  async getListingDetail(
+    @Param('listingId') listingId: string,
+    @Query('viewerPublicKey') viewerPublicKey?: string,
+  ): Promise<MarketplaceListingDetailDto> {
+    try {
+      const detail = await this.marketplaceService.getListingDetail(
+        listingId,
+        viewerPublicKey?.trim() || null,
+      );
+      return detail;
+    } catch (err) {
+      if (err instanceof MarketplaceError) {
+        this.throwHttp(err);
+      }
+      throw err;
+    }
   }
 
   @Get(':listingId')
+  @RateLimitTier('public-read')
   @ApiOperation({ summary: 'Get a specific listing' })
   @ApiParam({ name: 'listingId', description: 'Listing UUID' })
   @ApiResponse({ status: 200, description: 'Listing details' })
@@ -91,6 +131,7 @@ export class MarketplaceController {
   }
 
   @Delete(':listingId')
+  @RateLimitTier('mutation')
   @ApiOperation({ summary: 'Cancel a listing' })
   @ApiParam({ name: 'listingId', description: 'Listing UUID' })
   @ApiBody({ type: CancelListingDto })
@@ -113,6 +154,7 @@ export class MarketplaceController {
   }
 
   @Post(':listingId/bid')
+  @RateLimitTier('mutation')
   @ApiOperation({ summary: 'Place a bid on a listing' })
   @ApiParam({ name: 'listingId', description: 'Listing UUID' })
   @ApiBody({ type: PlaceBidDto })
@@ -139,6 +181,7 @@ export class MarketplaceController {
   }
 
   @Get(':listingId/bids')
+  @RateLimitTier('public-read')
   @ApiOperation({ summary: 'Get all bids for a listing' })
   @ApiParam({ name: 'listingId', description: 'Listing UUID' })
   @ApiQuery({ name: 'limit', required: false, description: 'Items per page (1-100)', example: 20 })
@@ -166,6 +209,7 @@ export class MarketplaceController {
   }
 
   @Post(':listingId/accept-bid/:bidId')
+  @RateLimitTier('mutation')
   @ApiOperation({ summary: 'Accept a bid — atomically transfers username ownership' })
   @ApiParam({ name: 'listingId', description: 'Listing UUID' })
   @ApiParam({ name: 'bidId', description: 'Bid UUID' })

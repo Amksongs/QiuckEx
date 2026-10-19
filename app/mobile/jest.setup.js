@@ -1,3 +1,5 @@
+global.IS_REACT_ACT_ENVIRONMENT = true;
+
 // Mock react-native-safe-area-context: replace SafeAreaView with a plain View
 jest.mock("react-native-safe-area-context", () => ({
   SafeAreaView: ({ children, ...props }) => {
@@ -46,11 +48,36 @@ jest.mock("expo-secure-store", () => {
   };
 });
 
-jest.mock("expo-notifications", () => ({
-  getPermissionsAsync: jest.fn(async () => ({ granted: true, ios: { allowsBadge: true } })),
-  requestPermissionsAsync: jest.fn(async () => ({ granted: true, ios: { allowsBadge: true } })),
-  setBadgeCountAsync: jest.fn(async () => true),
-}));
+jest.mock("expo-notifications", () => {
+  const pushTokenListeners = new Set();
+  return {
+    getPermissionsAsync: jest.fn(async () => ({
+      granted: true,
+      status: "granted",
+      canAskAgain: true,
+      ios: { status: "granted", allowsBadge: true, allowsAlert: true, allowsSound: true },
+    })),
+    requestPermissionsAsync: jest.fn(async () => ({
+      granted: true,
+      status: "granted",
+      canAskAgain: true,
+      ios: { status: "granted", allowsBadge: true, allowsAlert: true, allowsSound: true },
+    })),
+    setBadgeCountAsync: jest.fn(async () => true),
+    getExpoPushTokenAsync: jest.fn(async () => ({ data: "ExponentPushToken[test-token]" })),
+    getDevicePushTokenAsync: jest.fn(async () => ({ data: "test-device-token" })),
+    addPushTokenListener: jest.fn((listener) => {
+      pushTokenListeners.add(listener);
+      return {
+        remove: () => pushTokenListeners.delete(listener),
+      };
+    }),
+    __triggerPushTokenListener: (token) => {
+      for (const listener of pushTokenListeners) listener({ data: token });
+    },
+    __listeners: pushTokenListeners,
+  };
+});
 
 jest.mock("expo-background-task", () => ({
   BackgroundTaskResult: {
@@ -64,4 +91,8 @@ jest.mock("expo-background-task", () => ({
 jest.mock("expo-task-manager", () => ({
   defineTask: jest.fn(),
   isTaskRegisteredAsync: jest.fn(async () => false),
+}));
+
+jest.mock("expo-battery", () => ({
+  getBatteryLevelAsync: jest.fn(async () => 1),
 }));

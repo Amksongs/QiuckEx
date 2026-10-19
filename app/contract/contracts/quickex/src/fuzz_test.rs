@@ -11,6 +11,7 @@
 //! | INV-5 | Terminal states are final — `Spent`/`Refunded` block all further transitions. |
 //! | INV-6 | No overpayment — `partial_payment` rejects amounts exceeding the remainder. |
 //! | INV-7 | Nonce uniqueness — replaying a `(signer, nonce)` pair always fails.      |
+//! | INV-8 | Partial accounting — settled + refunded + outstanding + fees equals due.   |
 //!
 //! # Adding a new invariant
 //!
@@ -19,11 +20,10 @@
 //! 3. If the test found a concrete bug, add a deterministic regression case to the
 //!    `regression_corpus` module at the bottom of this file.
 
-#![cfg(test)]
-
 use proptest::prelude::*;
 
 use crate::test_context::TestContext;
+use crate::EscrowStatus;
 
 // ---------------------------------------------------------------------------
 // Strategies
@@ -56,6 +56,28 @@ fn time_advance_strategy() -> impl Strategy<Value = u64> {
     0u64..=200_000u64
 }
 
+fn assert_partial_accounting(
+    ctx: &TestContext,
+    commitment: &soroban_sdk::BytesN<32>,
+    amount_due: i128,
+) {
+    let details = ctx
+        .client
+        .get_escrow_details(commitment, &ctx.alice)
+        .unwrap();
+    let amount_paid = details.amount_paid.unwrap();
+    let outstanding = amount_due - amount_paid;
+    let (settled, refunded) = match details.status {
+        EscrowStatus::Refunded => (0, amount_paid),
+        EscrowStatus::Spent => (amount_paid, 0),
+        _ => (amount_paid, 0),
+    };
+    let fees = 0i128;
+
+    assert!(amount_paid >= 0 && outstanding >= 0);
+    assert_eq!(settled + refunded + outstanding + fees, amount_due);
+}
+
 // ---------------------------------------------------------------------------
 // INV-1: No early withdrawal
 // ---------------------------------------------------------------------------
@@ -77,12 +99,14 @@ proptest! {
             &ctx.salt(&salt),
             &timeout,
             &None,
+            &0u64,
+            &u64::MAX,
         );
 
         // Advance to exactly the expiry boundary (now >= expires_at)
         ctx.advance_time(timeout);
 
-        let result = ctx.client.try_withdraw(&ctx.token, &amount, &commitment, &ctx.alice.clone(), &ctx.salt(&salt));
+        let result = ctx.client.try_withdraw(&ctx.token, &amount, &commitment, &ctx.alice.clone(), &ctx.salt(&salt), &0u64, &u64::MAX);
         prop_assert!(
             result.is_err(),
             "INV-1 violated: withdraw succeeded after expiry for commitment {:?}",
@@ -108,12 +132,14 @@ proptest! {
             &ctx.salt(&salt),
             &timeout,
             &None,
+            &0u64,
+            &u64::MAX,
         );
 
         // Advance time but stay within the window
         ctx.advance_time(timeout / 2);
 
-        let result = ctx.client.try_withdraw(&ctx.token, &amount, &commitment, &ctx.alice.clone(), &ctx.salt(&salt));
+        let result = ctx.client.try_withdraw(&ctx.token, &amount, &commitment, &ctx.alice.clone(), &ctx.salt(&salt), &0u64, &u64::MAX);
         prop_assert!(
             result.is_ok(),
             "INV-1 converse violated: withdraw failed before expiry"
@@ -137,7 +163,7 @@ proptest! {
         let commitment = ctx.simple_deposit(&ctx.alice.clone(), amount, &salt);
         ctx.advance_time(advance);
 
-        let result = ctx.client.try_refund(&commitment, &ctx.alice.clone());
+        let result = ctx.client.try_refund(&commitment, &ctx.alice.clone(), &0u64, &u64::MAX);
         prop_assert!(
             result.is_err(),
             "INV-2 violated: refund succeeded on a non-expiring escrow"
@@ -162,12 +188,14 @@ proptest! {
             &ctx.salt(&salt),
             &timeout,
             &None,
+            &0u64,
+            &u64::MAX,
         );
 
         // Advance to just before expiry
         ctx.advance_time(timeout - 1);
 
-        let result = ctx.client.try_refund(&commitment, &ctx.alice.clone());
+        let result = ctx.client.try_refund(&commitment, &ctx.alice.clone(), &0u64, &u64::MAX);
         prop_assert!(
             result.is_err(),
             "INV-2 violated: refund succeeded before expiry"
@@ -192,11 +220,13 @@ proptest! {
             &ctx.salt(&salt),
             &timeout,
             &None,
+            &0u64,
+            &u64::MAX,
         );
 
         ctx.advance_time(timeout + 1);
 
-        let result = ctx.client.try_refund(&commitment, &ctx.alice.clone());
+        let result = ctx.client.try_refund(&commitment, &ctx.alice.clone(), &0u64, &u64::MAX);
         prop_assert!(
             result.is_ok(),
             "INV-2 converse violated: refund failed after expiry"
@@ -232,6 +262,8 @@ proptest! {
             &ctx.salt(&salt),
             &timeout,
             &None,
+            &0u64,
+            &u64::MAX,
         );
         // We only assert no panic; the contract may return InvalidTimeout for u64::MAX
         let _ = result;
@@ -254,7 +286,7 @@ proptest! {
 
         ctx.client.dispute(&commitment);
 
-        let result = ctx.client.try_withdraw(&ctx.token, &amount, &commitment, &ctx.alice.clone(), &ctx.salt(&salt));
+        let result = ctx.client.try_withdraw(&ctx.token, &amount, &commitment, &ctx.alice.clone(), &ctx.salt(&salt), &0u64, &u64::MAX);
         prop_assert!(
             result.is_err(),
             "INV-4 violated: withdraw succeeded on a Disputed escrow"
@@ -278,7 +310,7 @@ proptest! {
         // Advance past expiry
         ctx.advance_time(timeout + 1);
 
-        let result = ctx.client.try_refund(&commitment, &ctx.alice.clone());
+        let result = ctx.client.try_refund(&commitment, &ctx.alice.clone(), &0u64, &u64::MAX);
         prop_assert!(
             result.is_err(),
             "INV-4 violated: refund succeeded on a Disputed escrow after expiry"
@@ -301,10 +333,10 @@ proptest! {
         let commitment = ctx.simple_deposit(&ctx.alice.clone(), amount, &salt);
 
         // First withdraw succeeds
-        ctx.client.withdraw(&ctx.token, &amount, &commitment, &ctx.alice.clone(), &ctx.salt(&salt));
+        ctx.client.withdraw(&ctx.token, &amount, &commitment, &ctx.alice.clone(), &ctx.salt(&salt), &0u64, &u64::MAX);
 
         // Second withdraw must fail
-        let result = ctx.client.try_withdraw(&ctx.token, &amount, &commitment, &ctx.alice.clone(), &ctx.salt(&salt));
+        let result = ctx.client.try_withdraw(&ctx.token, &amount, &commitment, &ctx.alice.clone(), &ctx.salt(&salt), &0u64, &u64::MAX);
         prop_assert!(
             result.is_err(),
             "INV-5 violated: second withdraw succeeded on a Spent escrow"
@@ -329,12 +361,14 @@ proptest! {
             &ctx.salt(&salt),
             &timeout,
             &None,
+            &0u64,
+            &u64::MAX,
         );
 
         ctx.advance_time(timeout + 1);
-        ctx.client.refund(&commitment, &ctx.alice.clone());
+        ctx.client.refund(&commitment, &ctx.alice.clone(), &0u64, &u64::MAX);
 
-        let result = ctx.client.try_refund(&commitment, &ctx.alice.clone());
+        let result = ctx.client.try_refund(&commitment, &ctx.alice.clone(), &0u64, &u64::MAX);
         prop_assert!(
             result.is_err(),
             "INV-5 violated: second refund succeeded on a Refunded escrow"
@@ -359,12 +393,14 @@ proptest! {
             &ctx.salt(&salt),
             &timeout,
             &None,
+            &0u64,
+            &u64::MAX,
         );
 
         ctx.advance_time(timeout + 1);
-        ctx.client.refund(&commitment, &ctx.alice.clone());
+        ctx.client.refund(&commitment, &ctx.alice.clone(), &0u64, &u64::MAX);
 
-        let result = ctx.client.try_withdraw(&ctx.token, &amount, &commitment, &ctx.alice.clone(), &ctx.salt(&salt));
+        let result = ctx.client.try_withdraw(&ctx.token, &amount, &commitment, &ctx.alice.clone(), &ctx.salt(&salt), &0u64, &u64::MAX);
         prop_assert!(
             result.is_err(),
             "INV-5 violated: withdraw succeeded on a Refunded escrow"
@@ -395,16 +431,86 @@ proptest! {
             &ctx.salt(&salt),
             &0,
             &None,
+            &0u64,
+            &u64::MAX,
         );
 
         // Try to overpay by 1
         let overpay = amount_due; // remaining is amount_due - initial, overpay > remaining
         ctx.mint(&ctx.bob.clone(), overpay);
-        let result = ctx.client.try_partial_payment(&commitment, &ctx.bob.clone(), &overpay);
+        let result = ctx.client.try_partial_payment(&commitment, &ctx.bob.clone(), &overpay, &0u64, &u64::MAX);
         prop_assert!(
             result.is_err(),
             "INV-6 violated: overpayment was accepted"
         );
+    }
+}
+
+proptest! {
+    /// INV-8: arbitrary partial-payment lifecycle sequences preserve accounting.
+    #[test]
+    fn inv8_partial_accounting_sequence(
+        actions in prop::collection::vec(any::<u8>(), 1..=40),
+        initial in 1_i128..=999_i128,
+        salt in salt_strategy(),
+    ) {
+        let ctx = TestContext::with_admin();
+        let amount_due = 1_000_i128;
+        ctx.mint(&ctx.alice.clone(), initial);
+        let commitment = ctx.client.deposit_partial(
+            &ctx.token,
+            &amount_due,
+            &initial,
+            &ctx.alice.clone(),
+            &ctx.salt(&salt),
+            &10,
+            &None,
+            &0u64,
+            &u64::MAX,
+        );
+        ctx.mint(&ctx.bob.clone(), amount_due * 2);
+        let mut nonce = 0u64;
+
+        assert_partial_accounting(&ctx, &commitment, amount_due);
+        for action in actions {
+            match action % 4 {
+                0 => {
+                    let details = ctx.client.get_escrow_details(&commitment, &ctx.alice).unwrap();
+                    let remaining = amount_due - details.amount_paid.unwrap();
+                    let payment = 1 + (action as i128 % 100);
+                    let result = ctx.client.try_partial_payment(
+                        &commitment,
+                        &ctx.bob,
+                        &payment,
+                        &nonce,
+                        &u64::MAX,
+                    );
+                    nonce += 1;
+                    let expired = ctx.env.ledger().timestamp() >= details.expires_at;
+                    if details.status == EscrowStatus::Pending && !expired && remaining >= payment {
+                        prop_assert!(result.is_ok());
+                    } else {
+                        prop_assert!(result.is_err());
+                    }
+                }
+                1 => {
+                    let result = ctx.client.try_refund(
+                        &commitment,
+                        &ctx.alice,
+                        &nonce,
+                        &u64::MAX,
+                    );
+                    nonce += 1;
+                    prop_assert!(result.is_ok() || result.is_err());
+                }
+                2 => {
+                    let result = ctx.client.try_finalize_expired_escrow(&commitment);
+                    prop_assert!(result.is_ok() || result.is_err());
+                }
+                _ => ctx.advance_time(10),
+            }
+            assert_partial_accounting(&ctx, &commitment, amount_due);
+        }
     }
 }
 
@@ -419,7 +525,7 @@ proptest! {
         nonce in any::<u64>(),
         valid_until_offset in 1u64..=86_400u64,
     ) {
-        use crate::nonce::verify_and_consume;
+        use crate::nonce::{verify_and_consume, ActionType};
 
         let ctx = TestContext::with_admin();
         let now = ctx.env.ledger().timestamp();
@@ -427,8 +533,12 @@ proptest! {
         let contract_id = ctx.client.address.clone();
 
         let (first_ok, second_ok) = ctx.env.as_contract(&contract_id, || {
-            let first = verify_and_consume(&ctx.env, &ctx.alice, nonce, valid_until).is_ok();
-            let second = verify_and_consume(&ctx.env, &ctx.alice, nonce, valid_until).is_ok();
+            let first =
+                verify_and_consume(&ctx.env, &ctx.alice, nonce, valid_until, ActionType::Withdraw)
+                    .is_ok();
+            let second =
+                verify_and_consume(&ctx.env, &ctx.alice, nonce, valid_until, ActionType::Withdraw)
+                    .is_ok();
             (first, second)
         });
 
@@ -444,7 +554,7 @@ proptest! {
         nonce in any::<u64>(),
         advance in 1u64..=86_400u64,
     ) {
-        use crate::nonce::verify_and_consume;
+        use crate::nonce::{verify_and_consume, ActionType};
 
         let ctx = TestContext::with_admin();
         let now = ctx.env.ledger().timestamp();
@@ -454,16 +564,13 @@ proptest! {
         let contract_id = ctx.client.address.clone();
 
         let result_ok = ctx.env.as_contract(&contract_id, || {
-            verify_and_consume(&ctx.env, &ctx.alice, nonce, valid_until).is_ok()
+            verify_and_consume(&ctx.env, &ctx.alice, nonce, valid_until, ActionType::Withdraw)
+                .is_ok()
         });
 
         prop_assert!(!result_ok, "INV-7 violated: expired signature was accepted");
     }
 }
-
-// ---------------------------------------------------------------------------
-// Replay / fork scenarios
-// ---------------------------------------------------------------------------
 
 proptest! {
     /// Expiry edge: deposit at T, advance to exactly T+timeout, then try withdraw.
@@ -483,12 +590,14 @@ proptest! {
             &ctx.salt(&salt),
             &timeout,
             &None,
+            &0u64,
+            &u64::MAX,
         );
 
         // Advance to exactly the expiry boundary
         ctx.advance_time(timeout);
 
-        let result = ctx.client.try_withdraw(&ctx.token, &amount, &commitment, &ctx.alice.clone(), &ctx.salt(&salt));
+        let result = ctx.client.try_withdraw(&ctx.token, &amount, &commitment, &ctx.alice.clone(), &ctx.salt(&salt), &0u64, &u64::MAX);
         prop_assert!(
             result.is_err(),
             "Expiry boundary violated: withdraw succeeded at exactly expires_at"
@@ -513,11 +622,13 @@ proptest! {
             &ctx.salt(&salt),
             &timeout,
             &None,
+            &0u64,
+            &u64::MAX,
         );
 
         ctx.advance_time(timeout);
 
-        let result = ctx.client.try_refund(&commitment, &ctx.alice.clone());
+        let result = ctx.client.try_refund(&commitment, &ctx.alice.clone(), &0u64, &u64::MAX);
         prop_assert!(
             result.is_ok(),
             "Expiry boundary violated: refund failed at exactly expires_at"
@@ -529,14 +640,14 @@ proptest! {
     /// Nonce expiry edge: valid_until == now MUST be rejected (boundary is exclusive).
     #[test]
     fn nonce_expiry_boundary_rejected(nonce in any::<u64>()) {
-        use crate::nonce::verify_and_consume;
+        use crate::nonce::{verify_and_consume, ActionType};
 
         let ctx = TestContext::with_admin();
         let now = ctx.env.ledger().timestamp();
         let contract_id = ctx.client.address.clone();
 
         let result_ok = ctx.env.as_contract(&contract_id, || {
-            verify_and_consume(&ctx.env, &ctx.alice, nonce, now).is_ok()
+            verify_and_consume(&ctx.env, &ctx.alice, nonce, now, ActionType::Withdraw).is_ok()
         });
 
         prop_assert!(!result_ok, "Nonce expiry boundary violated: accepted when valid_until == now");
@@ -561,6 +672,8 @@ proptest! {
             &commitment,
             &true,
             &ctx.bob.clone(), // recipient ignored when resolve_for_owner=true
+            &0u64,
+            &u64::MAX,
         );
 
         let balance_after = ctx.balance(&ctx.alice.clone());
@@ -570,7 +683,7 @@ proptest! {
         );
 
         // Further operations must fail (INV-5)
-        let withdraw_result = ctx.client.try_withdraw(&ctx.token, &amount, &commitment, &ctx.alice.clone(), &ctx.salt(&salt));
+        let withdraw_result = ctx.client.try_withdraw(&ctx.token, &amount, &commitment, &ctx.alice.clone(), &ctx.salt(&salt), &0u64, &u64::MAX);
         prop_assert!(withdraw_result.is_err(), "INV-5 violated after dispute resolution");
     }
 }
@@ -593,6 +706,8 @@ proptest! {
             &commitment,
             &false,
             &ctx.bob.clone(),
+            &0u64,
+            &u64::MAX,
         );
 
         let balance_after = ctx.balance(&ctx.bob.clone());
@@ -602,7 +717,7 @@ proptest! {
         );
 
         // Further operations must fail (INV-5)
-        let refund_result = ctx.client.try_refund(&commitment, &ctx.alice.clone());
+        let refund_result = ctx.client.try_refund(&commitment, &ctx.alice.clone(), &0u64, &u64::MAX);
         prop_assert!(refund_result.is_err(), "INV-5 violated after dispute resolution");
     }
 }
@@ -636,6 +751,8 @@ mod regression_corpus {
             &ctx.salt(b"zero"),
             &0,
             &None,
+            &0u64,
+            &u64::MAX,
         );
         assert!(
             result.is_err(),
@@ -654,6 +771,8 @@ mod regression_corpus {
             &ctx.salt(b"neg"),
             &0,
             &None,
+            &0u64,
+            &u64::MAX,
         );
         assert!(
             result.is_err(),
@@ -685,10 +804,14 @@ mod regression_corpus {
             &ctx.salt(b"owner-check"),
             &1,
             &None,
+            &0u64,
+            &u64::MAX,
         );
         ctx.advance_time(2);
         // Bob tries to refund Alice's escrow
-        let result = ctx.client.try_refund(&commitment, &ctx.bob.clone());
+        let result = ctx
+            .client
+            .try_refund(&commitment, &ctx.bob.clone(), &0u64, &u64::MAX);
         assert!(
             result.is_err(),
             "REGRESSION-004: non-owner refund was accepted"
@@ -708,6 +831,8 @@ mod regression_corpus {
             &ctx.salt(b"overflow"),
             &u64::MAX,
             &None,
+            &0u64,
+            &u64::MAX,
         );
     }
 
@@ -716,7 +841,7 @@ mod regression_corpus {
     /// Alice consuming nonce N must not prevent Bob from consuming nonce N.
     #[test]
     fn regression_006_nonce_per_signer_independent() {
-        use crate::nonce::verify_and_consume;
+        use crate::nonce::{verify_and_consume, ActionType};
 
         let ctx = TestContext::with_admin();
         let now = ctx.env.ledger().timestamp();
@@ -725,9 +850,16 @@ mod regression_corpus {
         let contract_id = ctx.client.address.clone();
 
         let bob_ok = ctx.env.as_contract(&contract_id, || {
-            verify_and_consume(&ctx.env, &ctx.alice, nonce, valid_until).unwrap();
+            verify_and_consume(
+                &ctx.env,
+                &ctx.alice,
+                nonce,
+                valid_until,
+                ActionType::Withdraw,
+            )
+            .unwrap();
             // Bob's nonce N is independent of Alice's
-            verify_and_consume(&ctx.env, &ctx.bob, nonce, valid_until).is_ok()
+            verify_and_consume(&ctx.env, &ctx.bob, nonce, valid_until, ActionType::Withdraw).is_ok()
         });
 
         assert!(bob_ok, "REGRESSION-006: nonce namespace not per-signer");

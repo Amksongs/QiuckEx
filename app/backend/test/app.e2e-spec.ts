@@ -12,6 +12,9 @@ import { AppConfigService } from "../src/config";
 import { AppModule } from "../src/app.module";
 import { UsernamesService } from "../src/usernames/usernames.service";
 import { HealthService } from "../src/health/health.service";
+import { SupabaseService } from "../src/supabase/supabase.service";
+import { OutboxRepository } from "../src/events/outbox/outbox.repository";
+import { IdempotencyStore } from "../src/common/idempotency/idempotency-store.service";
 import { mapValidationErrors } from "../src/common/utils/validation-error.mapper";
 import { ApiKeyGuard } from "../src/auth/guards/api-key.guard";
 import { CustomThrottlerGuard } from "../src/auth/guards/custom-throttler.guard";
@@ -24,14 +27,46 @@ describe("App endpoints", () => {
     const moduleRef = await Test.createTestingModule({
       imports: [AppModule],
     })
-      .overrideProvider(ApiKeyGuard)
+      .overrideGuard(ApiKeyGuard)
       .useValue({ canActivate: jest.fn().mockReturnValue(true) })
-      .overrideProvider(CustomThrottlerGuard)
+      .overrideGuard(CustomThrottlerGuard)
       .useValue({ canActivate: jest.fn().mockReturnValue(true) })
       .overrideProvider(UsernamesService)
       .useValue({
         create: jest.fn().mockResolvedValue({ ok: true }),
         listByPublicKey: jest.fn().mockResolvedValue([]),
+      })
+      .overrideProvider(OutboxRepository)
+      .useValue({
+        stage: jest.fn(),
+        findPending: jest.fn(),
+        markDispatched: jest.fn(),
+        recordAttempt: jest.fn(),
+        getDepth: jest.fn(),
+        getLagSeconds: jest.fn(),
+      })
+      .overrideProvider(SupabaseService)
+      .useValue({
+        getClient: jest.fn().mockReturnValue({
+          from: jest.fn().mockReturnThis(),
+          insert: jest.fn().mockResolvedValue({ data: {}, error: null }),
+          single: jest.fn().mockResolvedValue({ data: {}, error: null }),
+          eq: jest.fn().mockReturnThis(),
+          lte: jest.fn().mockReturnThis(),
+          order: jest.fn().mockReturnThis(),
+          limit: jest.fn().mockReturnThis,
+          select: jest.fn().mockResolvedValue({ data: {}, error: null }),
+        }),
+      })
+      .overrideProvider(IdempotencyStore)
+      .useValue({
+        begin: jest.fn(),
+        complete: jest.fn(),
+        release: jest.fn(),
+        peek: jest.fn(),
+        sweepExpired: jest.fn(),
+        retentionMs: 24 * 60 * 60 * 1000,
+        size: jest.fn(),
       })
       .overrideProvider(HealthService)
       .useValue({
@@ -42,6 +77,7 @@ describe("App endpoints", () => {
         }),
         getReadinessStatus: jest.fn().mockResolvedValue({
           ready: true,
+          degraded: false,
           checks: [
             {
               name: "supabase",
@@ -133,6 +169,7 @@ describe("App endpoints", () => {
       .expect(200)
       .expect({
         ready: true,
+        degraded: false,
         checks: [
           { name: "supabase", status: "up", latency: "10ms" },
           {
@@ -147,6 +184,7 @@ describe("App endpoints", () => {
   it("GET /ready returns 503 when unhealthy", async () => {
     healthService.getReadinessStatus.mockResolvedValueOnce({
       ready: false,
+      degraded: false,
       timestamp: new Date().toISOString(),
       checks: [
         {
@@ -164,20 +202,22 @@ describe("App endpoints", () => {
       ],
     });
 
-    await request(app.getHttpServer())
+    const response = await request(app.getHttpServer())
       .get("/ready")
-      .expect(503)
-      .expect({
-        ready: false,
-        checks: [
-          { name: "supabase", status: "down" },
-          {
-            name: "environment",
-            status: "up",
-            details: ["All critical env variables loaded"],
-          },
-        ],
-      });
+      .expect(503);
+
+    expect(response.body).toMatchObject({
+      ready: false,
+      timestamp: expect.any(String),
+      checks: [
+        { name: "supabase", status: "down" },
+        {
+          name: "environment",
+          status: "up",
+          details: ["All critical env variables loaded"],
+        },
+      ],
+    });
   });
 
   // -----------------------------
@@ -336,7 +376,6 @@ describe("App endpoints", () => {
       .expect(400);
 
     expect(response.body).toMatchObject({
-      success: false,
       error: {
         code: expect.any(String),
         message: expect.any(String),

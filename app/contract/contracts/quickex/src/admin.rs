@@ -1,25 +1,28 @@
 use crate::errors::QuickexError;
 use crate::events::{
-    publish_admin_changed, publish_contract_migrated, publish_contract_paused,
-    publish_fee_collector_rotated, publish_per_asset_fee_set,
+    publish_admin_changed, publish_admin_transfer_accepted, publish_admin_transfer_cancelled,
+    publish_admin_transfer_proposed, publish_contract_initialized, publish_contract_migrated,
+    publish_fee_collector_rotated, publish_fee_withdrawn, publish_per_asset_fee_set,
+    publish_upgrade_completed, publish_upgrade_started,
 };
+use crate::fee;
 use crate::fee_router;
 use crate::storage;
-use crate::types::{FeeConfig, PerAssetFeeConfig, Role};
-use soroban_sdk::{Address, Env, Vec};
+use crate::types::{FeeConfig, PendingAdminProposal, PerAssetFeeConfig, Role};
+use soroban_sdk::{token, Address, Env, Vec};
 
 /// Initialize the contract with an admin address.
 ///
 /// This is a one-time operation; subsequent calls fail with [`AlreadyInitialized`].
 /// The initial admin is assigned the [`Role::Admin`] role.
 pub fn initialize(env: &Env, admin: Address) -> Result<(), QuickexError> {
-    if has_admin(env) {
+    if storage::is_initialized(env) || has_admin(env) {
         return Err(QuickexError::AlreadyInitialized);
     }
 
     // Set initial admin address (singleton for compatibility).
     storage::set_admin(env, &admin);
-    storage::set_paused(env, false);
+    storage::set_paused(env, false, 0);
     storage::set_contract_version(env, storage::CURRENT_CONTRACT_VERSION);
 
     // Grant Admin role to the initial administrator.
@@ -27,12 +30,33 @@ pub fn initialize(env: &Env, admin: Address) -> Result<(), QuickexError> {
     roles.push_back(Role::Admin);
     storage::set_roles(env, &admin, &roles);
 
+    // Mark the contract initialized only after all initialization writes succeed.
+    storage::set_initialized(env, true);
+
+    // Emit the initialization snapshot for indexers.
+    publish_contract_initialized(
+        env,
+        admin,
+        storage::CURRENT_CONTRACT_VERSION,
+        crate::events::EVENT_SCHEMA_VERSION,
+        false,
+    );
+
     Ok(())
 }
 
 /// Check if admin has been initialized.
 pub fn has_admin(env: &Env) -> bool {
     storage::get_admin(env).is_some()
+}
+
+/// Require that one-time contract initialization has completed.
+pub fn require_initialized(env: &Env) -> Result<(), QuickexError> {
+    if storage::is_initialized(env) {
+        Ok(())
+    } else {
+        Err(QuickexError::Unauthorized)
+    }
 }
 
 /// Get the current primary admin address.
@@ -48,11 +72,22 @@ pub fn has_role(env: &Env, address: &Address, role: Role) -> bool {
 
 /// Require that the caller has at least one of the specified roles.
 pub fn require_any_role(env: &Env, caller: &Address, roles: &[Role]) -> Result<(), QuickexError> {
+    require_initialized(env)?;
+
     caller.require_auth();
     let user_roles = storage::get_roles(env, caller);
     for role in roles {
         if user_roles.contains(*role) {
             return Ok(());
+        }
+    }
+    // Fallback: legacy deployments may not have role assignments.
+    // Accept the stored admin address as matching any Admin role request.
+    if roles.contains(&Role::Admin) {
+        if let Some(admin) = storage::get_admin(env) {
+            if admin == *caller {
+                return Ok(());
+            }
         }
     }
     Err(QuickexError::InsufficientRole)
@@ -100,11 +135,69 @@ pub fn revoke_role(
     Ok(())
 }
 
-/// Set a new primary admin address (**Admin only**).
-pub fn set_admin(env: &Env, caller: Address, new_admin: Address) -> Result<(), QuickexError> {
+// ─────────────────────────────────────────────────────────────────────────
+// Timelocked Two-Step Admin Transfer (Issue #870)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// The contract previously exposed an instant, single-call `set_admin` that
+// let a compromised admin key hand over control immediately and
+// irreversibly, with no window for anyone to notice or intervene. That
+// entrypoint has been removed. Admin transfer now ALWAYS goes through this
+// propose -> (wait out the timelock) -> accept flow, with cancellation
+// available to the current admin at any point before acceptance. There is
+// no faster path left that bypasses the delay.
+
+/// Propose a new admin, subject to a caller-chosen timelock (**Admin only**).
+///
+/// `delay_secs` must be at least [`storage::MIN_ADMIN_TRANSFER_DELAY`]; shorter
+/// values are rejected so the timelock can't be trivially bypassed. Overwrites
+/// any existing pending proposal. Emits `AdminTransferProposed`.
+pub fn propose_admin_transfer(
+    env: &Env,
+    caller: Address,
+    new_admin: Address,
+    delay_secs: u64,
+) -> Result<(), QuickexError> {
     require_admin(env, &caller)?;
 
-    let old_admin = storage::get_admin(env).unwrap();
+    if delay_secs < storage::MIN_ADMIN_TRANSFER_DELAY {
+        return Err(QuickexError::InvalidTimeout);
+    }
+
+    let eligible_at = env.ledger().timestamp().saturating_add(delay_secs);
+    let proposal = PendingAdminProposal {
+        proposed_admin: new_admin.clone(),
+        proposed_by: caller.clone(),
+        eligible_at,
+    };
+    storage::set_pending_admin_proposal(env, &proposal);
+
+    publish_admin_transfer_proposed(env, caller, new_admin, eligible_at);
+    Ok(())
+}
+
+/// Accept a pending admin-transfer proposal once its timelock has elapsed.
+///
+/// Must be called by the exact address named in the proposal. Performs the
+/// admin/role handover in a single atomic step and clears the proposal.
+/// Emits `AdminTransferAccepted`.
+pub fn accept_admin_transfer(env: &Env, caller: Address) -> Result<(), QuickexError> {
+    caller.require_auth();
+
+    let proposal =
+        storage::get_pending_admin_proposal(env).ok_or(QuickexError::NoPendingAdminProposal)?;
+
+    if proposal.proposed_admin != caller {
+        return Err(QuickexError::InvalidAcceptor);
+    }
+
+    if env.ledger().timestamp() < proposal.eligible_at {
+        return Err(QuickexError::AdminTimelockNotElapsed);
+    }
+
+    let old_admin = storage::get_admin(env).ok_or(QuickexError::Unauthorized)?;
+    let new_admin = proposal.proposed_admin;
+
     storage::set_admin(env, &new_admin);
 
     // Revoke Admin role from old admin.
@@ -124,17 +217,35 @@ pub fn set_admin(env: &Env, caller: Address, new_admin: Address) -> Result<(), Q
         storage::set_roles(env, &new_admin, &roles);
     }
 
+    storage::clear_pending_admin_proposal(env);
+
+    publish_admin_transfer_accepted(env, old_admin.clone(), new_admin.clone());
+    // Also emit the general AdminChanged event so existing indexers built
+    // around `set_admin` keep working for this path too.
     publish_admin_changed(env, old_admin, new_admin);
     Ok(())
 }
 
-/// Set the paused state (**Admin or Operator only**).
-pub fn set_paused(env: &Env, caller: Address, new_state: bool) -> Result<(), QuickexError> {
-    require_any_role(env, &caller, &[Role::Admin, Role::Operator])?;
+/// Cancel a pending admin-transfer proposal (**current Admin only**).
+///
+/// Any admin may cancel, not just the original proposer — this matters if
+/// role membership changed since the proposal was made. Emits
+/// `AdminTransferCancelled`.
+pub fn cancel_admin_transfer(env: &Env, caller: Address) -> Result<(), QuickexError> {
+    require_admin(env, &caller)?;
 
-    storage::set_paused(env, new_state);
-    publish_contract_paused(env, caller, new_state);
+    let proposal =
+        storage::get_pending_admin_proposal(env).ok_or(QuickexError::NoPendingAdminProposal)?;
+
+    storage::clear_pending_admin_proposal(env);
+
+    publish_admin_transfer_cancelled(env, caller, proposal.proposed_admin);
     Ok(())
+}
+
+/// Get the currently pending admin-transfer proposal, if any.
+pub fn get_pending_admin_transfer(env: &Env) -> Option<PendingAdminProposal> {
+    storage::get_pending_admin_proposal(env)
 }
 
 /// Check if the contract is paused.
@@ -171,24 +282,107 @@ pub fn migrate(env: &Env, caller: &Address) -> Result<u32, QuickexError> {
         return Err(QuickexError::InvalidContractVersion);
     }
 
-    let mut version = from_version;
-    while version < storage::CURRENT_CONTRACT_VERSION {
-        version = match version {
-            storage::LEGACY_CONTRACT_VERSION => migrate_legacy_to_v1(env),
-            _ => return Err(QuickexError::InvalidContractVersion),
-        };
-    }
+    // SC-W8-10 (Issue #871): apply every registered step from `from_version`
+    // up to `CURRENT_CONTRACT_VERSION`, in order, via the versioned
+    // migration registry. `?` propagates a mid-chain step failure as-is —
+    // Soroban rolls back every write this invocation made (including any
+    // earlier steps that already ran), so state is left at `from_version`,
+    // never partially migrated. See `migration.rs` for the registry and
+    // `upgrade_harness_failed_migration_leaves_version_at_prior_value` in
+    // `upgrade_test.rs` for the end-to-end proof.
+    let version = crate::migration::run(env, from_version, storage::CURRENT_CONTRACT_VERSION)?;
 
     if version != from_version {
         publish_contract_migrated(env, caller, from_version, version);
     }
 
+    // Post-upgrade invariant checks (Issue #432)
+    if let Err(_msg) = storage::assert_post_upgrade_invariants(env) {
+        env.panic_with_error(QuickexError::InternalError);
+    }
+
     Ok(version)
 }
 
-fn migrate_legacy_to_v1(env: &Env) -> u32 {
-    storage::set_contract_version(env, storage::CURRENT_CONTRACT_VERSION);
-    storage::CURRENT_CONTRACT_VERSION
+// ─────────────────────────────────────────────────────────────────────────
+// Upgrade Gating (Issue #432)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Set the upgrade window during which upgrades are permitted.
+///
+/// **Admin only**. Define `[start, end)` epoch seconds:
+/// - `start` = 0: no window set (upgrades blocked)
+/// - `end` = 0: no upper bound (upgrades allowed from start onwards)
+pub fn set_upgrade_window(
+    env: &Env,
+    caller: &Address,
+    start: u64,
+    end: u64,
+) -> Result<(), QuickexError> {
+    require_admin(env, caller)?;
+    storage::set_upgrade_window(env, start, end);
+    Ok(())
+}
+
+/// Start an upgrade (enters gating state; requires active window).
+///
+/// **Admin only**. Emits `UpgradeStarted` event with old/new versions.
+/// Blocks if window is not active or upgrade already in progress.
+pub fn start_upgrade(env: &Env, caller: &Address, new_version: u32) -> Result<(), QuickexError> {
+    require_admin(env, caller)?;
+
+    // Check upgrade window is active (Issue #432 AC1)
+    if !storage::is_upgrade_window_active(env) {
+        return Err(QuickexError::InvalidAmount); // Repurpose for "upgrade window not active"
+    }
+
+    if storage::is_upgrade_in_progress(env) {
+        return Err(QuickexError::ContractPaused); // Reuse for "upgrade in progress"
+    }
+
+    let old_version = get_version(env);
+    let (window_start, window_end) = storage::get_upgrade_window(env);
+
+    storage::set_upgrade_in_progress(env, true);
+    publish_upgrade_started(
+        env,
+        caller,
+        old_version,
+        new_version,
+        window_start,
+        window_end,
+    );
+
+    Ok(())
+}
+
+/// Complete an upgrade (migrate state, update version, emit event).
+///
+/// **Admin only**. Must be called after `start_upgrade` to finalize.
+/// Calls `migrate()` internally and re-checks invariants.
+pub fn complete_upgrade(
+    env: &Env,
+    caller: &Address,
+    new_version: u32,
+) -> Result<u32, QuickexError> {
+    if !storage::is_upgrade_in_progress(env) {
+        return Err(QuickexError::InternalError); // Not in upgrade state
+    }
+
+    let old_version = get_version(env);
+
+    // Run migration
+    let migrated_version = migrate(env, caller)?;
+
+    // Ensure new version matches expected (Issue #432 AC2)
+    if migrated_version != new_version && new_version != 0 {
+        return Err(QuickexError::InvalidContractVersion);
+    }
+
+    storage::set_upgrade_in_progress(env, false);
+    publish_upgrade_completed(env, caller, old_version, migrated_version);
+
+    Ok(migrated_version)
 }
 
 /// Require that the contract is not paused.
@@ -206,19 +400,42 @@ pub fn set_pause_flags(
     caller: &Address,
     flags_to_enable: u64,
     flags_to_disable: u64,
+    reason: u32,
+    event_reason: u32,
 ) -> Result<(), QuickexError> {
     require_any_role(env, caller, &[Role::Admin, Role::Operator])?;
 
-    storage::set_pause_flags(env, caller, flags_to_enable, flags_to_disable);
+    storage::set_pause_flags(env, caller, flags_to_enable, flags_to_disable, reason);
+
+    if flags_to_enable > 0 {
+        crate::events::publish_pause_enabled(
+            env,
+            caller.clone(),
+            false,
+            flags_to_enable,
+            event_reason,
+        );
+    }
+    if flags_to_disable > 0 {
+        crate::events::publish_pause_disabled(
+            env,
+            caller.clone(),
+            false,
+            flags_to_disable,
+            event_reason,
+        );
+    }
     Ok(())
 }
 
 /// Set fee configuration (**Admin or Operator only**).
 pub fn set_fee_config(env: &Env, caller: &Address, config: FeeConfig) -> Result<(), QuickexError> {
     require_any_role(env, caller, &[Role::Admin, Role::Operator])?;
+    fee::validate_fee_bps(config.fee_bps)?;
 
+    let old_fee_bps = storage::get_fee_config(env).fee_bps;
     storage::set_fee_config(env, &config);
-    crate::events::publish_fee_config_changed(env, config.fee_bps);
+    crate::events::publish_fee_config_changed(env, old_fee_bps, config.fee_bps);
     Ok(())
 }
 
@@ -231,12 +448,22 @@ pub fn set_per_asset_fee(
 ) -> Result<(), QuickexError> {
     require_any_role(env, caller, &[Role::Admin, Role::Operator])?;
 
-    if config.fee_bps > 10_000 || config.arbiter_bps > 10_000 {
-        return Err(QuickexError::InvalidAmount);
-    }
+    fee::validate_fee_bps(config.fee_bps)?;
+    fee::validate_fee_bps(config.arbiter_bps)?;
+
+    let previous = storage::get_per_asset_fee(env, &token);
+    let old_fee_bps = previous.as_ref().map(|c| c.fee_bps).unwrap_or(0);
+    let old_arbiter_bps = previous.as_ref().map(|c| c.arbiter_bps).unwrap_or(0);
 
     storage::set_per_asset_fee(env, &token, &config);
-    publish_per_asset_fee_set(env, token, config.fee_bps, config.arbiter_bps);
+    publish_per_asset_fee_set(
+        env,
+        token,
+        old_fee_bps,
+        old_arbiter_bps,
+        config.fee_bps,
+        config.arbiter_bps,
+    );
     Ok(())
 }
 
@@ -275,4 +502,56 @@ pub fn rotate_fee_collector(
     let next_index = fee_router::rotate_collector(env, &new_collector);
     publish_fee_collector_rotated(env, new_collector, next_index);
     Ok(next_index)
+}
+
+/// Withdraw accrued protocol fees for `token` to `recipient` (**Admin only**;
+/// Issue #866 / SC-W8-05).
+///
+/// Draws exclusively from the accrued-fee treasury ledger
+/// (`storage::AccruedFees`), which is only ever credited from the
+/// platform-fee portion of a settlement that had no configured collector to
+/// forward to (see `fee_router::route_payout*`). Escrowed principal is never
+/// credited to this ledger, so a withdrawal can never touch it — enforced
+/// structurally, not just by convention.
+///
+/// # Errors
+/// - [`QuickexError::InvalidAmount`] – `amount` is zero or negative.
+/// - [`QuickexError::Overpayment`] – `amount` exceeds the token's accrued
+///   balance (reused here rather than a dedicated variant — see the
+///   capacity note on [`QuickexError`]).
+/// - [`QuickexError::InsufficientRole`] – caller is not admin.
+pub fn withdraw_fees(
+    env: &Env,
+    caller: &Address,
+    token: Address,
+    amount: i128,
+    recipient: Address,
+) -> Result<(), QuickexError> {
+    require_admin(env, caller)?;
+
+    if amount <= 0 {
+        return Err(QuickexError::InvalidAmount);
+    }
+
+    storage::subtract_accrued_fee(env, &token, amount)?;
+
+    let token_client = token::Client::new(env, &token);
+    token_client.transfer(&env.current_contract_address(), &recipient, &amount);
+
+    publish_fee_withdrawn(env, token, caller.clone(), amount, recipient);
+    Ok(())
+}
+
+/// Set whether a hook contract is allowed to be registered (**Admin only**).
+pub fn set_hook_allowed(
+    env: &Env,
+    caller: &Address,
+    hook_contract: Address,
+    allowed: bool,
+) -> Result<(), QuickexError> {
+    require_admin(env, caller)?;
+
+    storage::set_hook_allowed(env, &hook_contract, allowed);
+    crate::events::publish_hook_allowlist_changed(env, hook_contract, allowed);
+    Ok(())
 }

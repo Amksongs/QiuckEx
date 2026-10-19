@@ -8,21 +8,23 @@ import { UsernameValidationError, UsernameErrorCode } from './errors';
 describe('UsernamesController - Public Profile Discovery (Integration)', () => {
   let controller: UsernamesController;
   let serviceMock: {
-    searchPublicUsernames: jest.Mock;
+    searchDiscovery: jest.Mock;
     getTrendingCreators: jest.Mock;
     togglePublicProfile: jest.Mock;
     listByPublicKey: jest.Mock;
     create: jest.Mock;
+    getProfileByUsername: jest.Mock;
   };
   let eventEmitterMock: Partial<EventEmitter2>;
 
   beforeEach(async () => {
     serviceMock = {
-      searchPublicUsernames: jest.fn(),
+      searchDiscovery: jest.fn(),
       getTrendingCreators: jest.fn(),
       togglePublicProfile: jest.fn(),
       listByPublicKey: jest.fn(),
       create: jest.fn(),
+      getProfileByUsername: jest.fn(),
     };
 
     eventEmitterMock = {
@@ -54,17 +56,23 @@ describe('UsernamesController - Public Profile Discovery (Integration)', () => {
     it('should return search results with similarity scores', async () => {
       const mockResults = [
         {
+          kind: 'profile' as const,
           id: '1',
           username: 'alice',
-          public_key: 'GBXGQ55JMQ4L2B6E7S8Y9Z0A1B2C3D4E5F6G7H8I7YWR',
-          created_at: '2025-02-19T08:00:00Z',
-          last_active_at: '2025-03-27T10:00:00Z',
-          is_public: true,
-          similarity_score: 95,
+          publicKey: 'GBXGQ55JMQ4L2B6E7S8Y9Z0A1B2C3D4E5F6G7H8I7YWR1234567890AB',
+          createdAt: '2025-02-19T08:00:00Z',
+          lastActiveAt: '2025-03-27T10:00:00Z',
+          similarityScore: 95,
         },
       ];
 
-      serviceMock.searchPublicUsernames.mockResolvedValue(mockResults);
+      serviceMock.searchDiscovery.mockResolvedValue({
+        results: mockResults,
+        empty: false,
+        total: 1,
+        next_cursor: null,
+        has_more: false,
+      });
 
       const result = await controller.searchUsernames({
         query: 'alice',
@@ -80,17 +88,23 @@ describe('UsernamesController - Public Profile Discovery (Integration)', () => {
     it('should map database fields to DTO correctly', async () => {
       const mockResults = [
         {
+          kind: 'profile' as const,
           id: '1',
           username: 'bob',
-          public_key: 'GCXHJ66KNR5M3C7F8T9A0B1C2D3E4F5G6H7I8J9K0LAS',
-          created_at: '2025-02-20T08:00:00Z',
-          last_active_at: '2025-03-26T10:00:00Z',
-          is_public: true,
-          similarity_score: 80,
+          publicKey: 'GCXHJ66KNR5M3C7F8T9A0B1C2D3E4F5G6H7I8J9K0LAS',
+          createdAt: '2025-02-20T08:00:00Z',
+          lastActiveAt: '2025-03-26T10:00:00Z',
+          similarityScore: 80,
         },
       ];
 
-      serviceMock.searchPublicUsernames.mockResolvedValue(mockResults);
+      serviceMock.searchDiscovery.mockResolvedValue({
+        results: mockResults,
+        empty: false,
+        total: 1,
+        next_cursor: null,
+        has_more: false,
+      });
 
       const result = await controller.searchUsernames({
         query: 'bob',
@@ -133,7 +147,11 @@ describe('UsernamesController - Public Profile Discovery (Integration)', () => {
         },
       ];
 
-      serviceMock.getTrendingCreators.mockResolvedValue(mockCreators);
+      serviceMock.getTrendingCreators.mockResolvedValue({
+        data: mockCreators,
+        next_cursor: null,
+        has_more: false,
+      });
 
       const result = await controller.getTrendingCreators({
         timeWindowHours: 24,
@@ -162,7 +180,11 @@ describe('UsernamesController - Public Profile Discovery (Integration)', () => {
         },
       ];
 
-      serviceMock.getTrendingCreators.mockResolvedValue(mockCreators);
+      serviceMock.getTrendingCreators.mockResolvedValue({
+        data: mockCreators,
+        next_cursor: null,
+        has_more: false,
+      });
 
       const result = await controller.getTrendingCreators({
         timeWindowHours: 48,
@@ -181,14 +203,14 @@ describe('UsernamesController - Public Profile Discovery (Integration)', () => {
 
       const result = await controller.togglePublicProfile({
         username: 'alice',
-        publicKey: 'GBXGQ55JMQ4L2B6E7S8Y9Z0A1B2C3D4E5F6G7H8I7YWR',
+        publicKey: 'GBXGQ55JMQ4L2B6E7S8Y9Z0A1B2C3D4E5F6G7H8I7YWR1234567890AB',
         isPublic: true,
       });
 
       expect(result.ok).toBe(true);
       expect(serviceMock.togglePublicProfile).toHaveBeenCalledWith(
         'alice',
-        'GBXGQ55JMQ4L2B6E7S8Y9Z0A1B2C3D4E5F6G7H8I7YWR',
+        'GBXGQ55JMQ4L2B6E7S8Y9Z0A1B2C3D4E5F6G7H8I7YWR1234567890AB',
         true,
       );
     });
@@ -205,7 +227,7 @@ describe('UsernamesController - Public Profile Discovery (Integration)', () => {
       await expect(
         controller.togglePublicProfile({
           username: 'nonexistent',
-          publicKey: 'GBXGQ55JMQ4L2B6E7S8Y9Z0A1B2C3D4E5F6G7H8I7YWR',
+          publicKey: 'GBXGQ55JMQ4L2B6E7S8Y9Z0A1B2C3D4E5F6G7H8I7YWR1234567890AB',
           isPublic: true,
         }),
       ).rejects.toThrow(NotFoundException);
@@ -223,10 +245,63 @@ describe('UsernamesController - Public Profile Discovery (Integration)', () => {
       await expect(
         controller.togglePublicProfile({
           username: 'INVALID',
-          publicKey: 'GBXGQ55JMQ4L2B6E7S8Y9Z0A1B2C3D4E5F6G7H8I7YWR',
+          publicKey: 'GBXGQ55JMQ4L2B6E7S8Y9Z0A1B2C3D4E5F6G7H8I7YWR1234567890AB',
           isPublic: true,
         }),
       ).rejects.toThrow(BadRequestException);
+    });
+  });
+
+  describe('GET /username/:username', () => {
+    it('should return public profile successfully', async () => {
+      serviceMock.getProfileByUsername.mockResolvedValue({
+        id: '1',
+        username: 'alice',
+        public_key: 'GBXGQ55JMQ4L2B6E7S8Y9Z0A1B2C3D4E5F6G7H8I7YWR1234567890AB',
+        is_public: true,
+        created_at: '2025-02-19T08:00:00Z',
+        last_active_at: '2025-03-27T10:00:00Z',
+      });
+
+      const result = await controller.getProfile('alice');
+
+      expect(result).toEqual({
+        id: '1',
+        username: 'alice',
+        publicKey: 'GBXGQ55JMQ4L2B6E7S8Y9Z0A1B2C3D4E5F6G7H8I7YWR1234567890AB',
+        isPublic: true,
+        createdAt: '2025-02-19T08:00:00Z',
+        lastActiveAt: '2025-03-27T10:00:00Z',
+      });
+    });
+
+    it('should return privacy-aware profile if profile is private', async () => {
+      serviceMock.getProfileByUsername.mockResolvedValue({
+        id: '1',
+        username: 'bob',
+        public_key: 'GCXHJ66KNR5M3C7F8T9A0B1C2D3E4F5G6H7I8J9K0LAS',
+        is_public: false,
+        created_at: '2025-02-20T08:00:00Z',
+        last_active_at: '2025-03-26T10:00:00Z',
+      });
+
+      const result = await controller.getProfile('bob');
+
+      expect(result).toEqual({
+        username: 'bob',
+        isPublic: false,
+      });
+    });
+
+    it('should throw NotFoundException if username not found', async () => {
+      const error = new UsernameValidationError(
+        UsernameErrorCode.NOT_FOUND,
+        'Username not found',
+        'username',
+      );
+      serviceMock.getProfileByUsername.mockRejectedValue(error);
+
+      await expect(controller.getProfile('nonexistent')).rejects.toThrow(NotFoundException);
     });
   });
 });

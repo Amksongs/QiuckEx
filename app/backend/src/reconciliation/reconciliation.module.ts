@@ -7,12 +7,15 @@ import { IngestionModule } from "../ingestion/ingestion.module";
 import { JobQueueModule } from "../job-queue/job-queue.module";
 import { FeatureFlagsModule } from "../feature-flags/feature-flags.module";
 import { AuditModule } from "../audit/audit.module";
-import { SentryModule } from "../sentry/sentry.module";
+import { PreviewScopeModule } from "../preview-scope/preview-scope.module";
+import { SentryModule } from "../sentry";
+import { ApiKeysModule } from "../api-keys/api-keys.module";
 import { ReconciliationService } from "./reconciliation.service";
 import { ReconciliationWorkerService } from "./reconciliation-worker.service";
 import { BackfillService } from "./backfill.service";
 import { AutoMatchService } from "./auto-match.service";
 import { UnmatchedQueueRepository } from "./unmatched-queue.repository";
+import { ReconciliationRunRepository } from "./reconciliation-run.repository";
 import { ReconciliationController } from "./reconciliation.controller";
 
 @Module({
@@ -20,11 +23,13 @@ import { ReconciliationController } from "./reconciliation.controller";
     AppConfigModule,
     SupabaseModule,
     MetricsModule,
+    SentryModule,
     IngestionModule,
     forwardRef(() => JobQueueModule),
     FeatureFlagsModule,
     AuditModule,
-    SentryModule,
+    PreviewScopeModule,
+    ApiKeysModule,
   ],
   providers: [
     ReconciliationService,
@@ -32,6 +37,7 @@ import { ReconciliationController } from "./reconciliation.controller";
     BackfillService,
     AutoMatchService,
     UnmatchedQueueRepository,
+    ReconciliationRunRepository,
   ],
   controllers: [ReconciliationController],
   exports: [
@@ -40,6 +46,7 @@ import { ReconciliationController } from "./reconciliation.controller";
     BackfillService,
     AutoMatchService,
     UnmatchedQueueRepository,
+    ReconciliationRunRepository,
   ],
 })
 export class ReconciliationModule {}

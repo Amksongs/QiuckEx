@@ -35,7 +35,19 @@ describe("WebhooksController (e2e)", () => {
         totalFailed: 0,
         pendingRetries: 0,
       }),
-      redeliverEvent: jest.fn().mockResolvedValue(true),
+      listDeliveryAttempts: jest.fn().mockResolvedValue({
+        data: [],
+        next_cursor: null,
+        has_more: false,
+      }),
+      getDeliveryAttempt: jest.fn().mockResolvedValue(null),
+      redeliverEvent: jest.fn().mockResolvedValue({
+        queued: true,
+        deliverySuccess: true,
+        message: "Event redelivery triggered successfully",
+      }),
+      getDeliveryStatus: jest.fn(),
+      getReplayHistory: jest.fn().mockResolvedValue([]),
     };
 
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -268,7 +280,12 @@ describe("WebhooksController (e2e)", () => {
         minAmountStroops: "0",
         enabled: true,
       });
-      (mockWebhookService.redeliverEvent as jest.Mock).mockResolvedValueOnce(true);
+      (mockWebhookService.redeliverEvent as jest.Mock).mockResolvedValueOnce({
+        queued: true,
+        deliverySuccess: true,
+        message: "Event redelivery triggered successfully",
+        replayId: "replay-1",
+      });
 
       return request(app.getHttpServer())
         .post(`/webhooks/${PUBLIC_KEY}/${WEBHOOK_ID}/redeliver`)
@@ -276,6 +293,7 @@ describe("WebhooksController (e2e)", () => {
         .expect(200)
         .expect((res) => {
           expect(res.body.queued).toBe(true);
+          expect(res.body.replayId).toBe("replay-1");
         });
     });
 
@@ -286,6 +304,133 @@ describe("WebhooksController (e2e)", () => {
         .post(`/webhooks/${PUBLIC_KEY}/nonexistent/redeliver`)
         .send({ eventId: "tx_abc123", eventType: "payment.received" })
         .expect(404);
+    });
+  });
+
+  describe("GET /webhooks/:publicKey/:id/attempts", () => {
+    it("should list filtered delivery attempts for the endpoint", () => {
+      (mockWebhookService.getWebhook as jest.Mock).mockResolvedValueOnce({
+        id: WEBHOOK_ID,
+        publicKey: PUBLIC_KEY,
+        webhookUrl: "https://example.com/webhook",
+        secret: "whsec_test",
+        events: null,
+        minAmountStroops: "0",
+        enabled: true,
+      });
+      (mockWebhookService.listDeliveryAttempts as jest.Mock).mockResolvedValueOnce({
+        data: [
+          {
+            id: "attempt-1",
+            webhookId: WEBHOOK_ID,
+            eventType: "payment.received",
+            eventId: "tx_abc123",
+            status: "failed",
+            attempts: 3,
+            retryCount: 2,
+            lastError: "Authorization: Bearer sk_live_secret_123",
+            createdAt: "2024-01-15T10:00:00Z",
+            updatedAt: "2024-01-15T10:05:00Z",
+            payloadMetadata: { token: "[REDACTED]" },
+          },
+        ],
+        next_cursor: null,
+        has_more: false,
+      });
+
+      return request(app.getHttpServer())
+        .get(`/webhooks/${PUBLIC_KEY}/${WEBHOOK_ID}/attempts?status=failed&eventType=payment.received`)
+        .expect(200)
+        .expect((res) => {
+          expect(res.body.data).toHaveLength(1);
+          expect(res.body.data[0].retryCount).toBe(2);
+          expect(res.body.data[0].payloadMetadata.token).toBe("[REDACTED]");
+        });
+    });
+
+    it("should return 404 when the endpoint does not belong to the public key", () => {
+      (mockWebhookService.getWebhook as jest.Mock).mockResolvedValueOnce({
+        id: WEBHOOK_ID,
+        publicKey: "GDIFFERENT",
+        webhookUrl: "https://example.com/webhook",
+        secret: "whsec_test",
+        events: null,
+        minAmountStroops: "0",
+        enabled: true,
+      });
+
+      return request(app.getHttpServer())
+        .get(`/webhooks/${PUBLIC_KEY}/${WEBHOOK_ID}/attempts`)
+        .expect(404);
+    });
+  });
+
+  describe("GET /webhooks/:publicKey/:id/deliveries/:eventType/:eventId", () => {
+    it("should return delivery status with retry visibility", () => {
+      (mockWebhookService.getWebhook as jest.Mock).mockResolvedValueOnce({
+        id: WEBHOOK_ID,
+        publicKey: PUBLIC_KEY,
+        webhookUrl: "https://example.com/webhook",
+        secret: "whsec_test",
+        events: null,
+        minAmountStroops: "0",
+        enabled: true,
+      });
+      (mockWebhookService.getDeliveryStatus as jest.Mock).mockResolvedValueOnce({
+        eventId: "tx_abc123",
+        eventType: "payment.received",
+        status: "failed",
+        attempts: 2,
+        maxAttempts: 5,
+        lastError: "HTTP 500",
+        nextRetryAt: "2024-01-15T10:06:00Z",
+        createdAt: "2024-01-15T10:00:00Z",
+        updatedAt: "2024-01-15T10:05:00Z",
+        replayCount: 0,
+      });
+
+      return request(app.getHttpServer())
+        .get(
+          `/webhooks/${PUBLIC_KEY}/${WEBHOOK_ID}/deliveries/payment.received/tx_abc123`,
+        )
+        .expect(200)
+        .expect((res) => {
+          expect(res.body.lastError).toBe("HTTP 500");
+          expect(res.body.nextRetryAt).toBeDefined();
+        });
+    });
+  });
+
+  describe("GET /webhooks/:publicKey/:id/replays", () => {
+    it("should return replay audit history", () => {
+      (mockWebhookService.getWebhook as jest.Mock).mockResolvedValueOnce({
+        id: WEBHOOK_ID,
+        publicKey: PUBLIC_KEY,
+        webhookUrl: "https://example.com/webhook",
+        secret: "whsec_test",
+        events: null,
+        minAmountStroops: "0",
+        enabled: true,
+      });
+      (mockWebhookService.getReplayHistory as jest.Mock).mockResolvedValueOnce([
+        {
+          id: "replay-1",
+          eventType: "payment.received",
+          eventId: "tx_abc123",
+          status: "succeeded",
+          triggeredBy: "api",
+          deliverySuccess: true,
+          createdAt: "2024-01-15T10:10:00Z",
+        },
+      ]);
+
+      return request(app.getHttpServer())
+        .get(`/webhooks/${PUBLIC_KEY}/${WEBHOOK_ID}/replays`)
+        .expect(200)
+        .expect((res) => {
+          expect(res.body).toHaveLength(1);
+          expect(res.body[0].status).toBe("succeeded");
+        });
     });
   });
 });

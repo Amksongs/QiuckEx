@@ -1,4 +1,4 @@
-//! # Upgrade Simulation Test Harness — Issue #310
+//! # Upgrade Simulation Test Harness — Issue #310 + #432
 //!
 //! Creates a repeatable test harness that:
 //! 1. Deploys `LegacyV0Contract` (schema version 0) and populates a "golden state"
@@ -9,26 +9,31 @@
 //! 3. Validates all invariants and data integrity after the upgrade.
 //! 4. Provides regression tests for known migration pitfalls.
 //!
-//! ## Acceptance criteria (Issue #310)
+//! ## Acceptance criteria (Issue #310 + #432)
 //! - Upgrade tests run locally and deterministically.
 //! - No data loss or corruption across migrations.
 //! - Invariants are validated with clear failure messages.
+//! - Upgrade window gating works (blocks outside window).
+//! - Post-upgrade invariants enforced deterministically (AC2).
+//! - Upgrade start/complete events emitted for indexing (AC3).
 //!
 //! ## Running
 //! ```sh
 //! cargo test upgrade_harness_ -- --nocapture
+//! cargo test upgrade_safety_gate_ -- --nocapture
 //! ```
 
 use crate::{
     errors::QuickexError,
-    storage::{CURRENT_CONTRACT_VERSION, LEGACY_CONTRACT_VERSION, PRIVACY_ENABLED_KEY},
+    events::EVENT_SCHEMA_VERSION,
+    storage::{DataKey, CURRENT_CONTRACT_VERSION, LEGACY_CONTRACT_VERSION, PRIVACY_ENABLED_KEY},
     types::FeeConfig,
     EscrowStatus, QuickexContract, QuickexContractClient,
 };
 use soroban_sdk::{
     contract, contractimpl,
-    testutils::{Address as _, Ledger},
-    token, Address, Bytes, BytesN, Env, Symbol,
+    testutils::{Address as _, Events, Ledger},
+    token, Address, Bytes, BytesN, Env, Symbol, TryIntoVal,
 };
 
 // ============================================================================
@@ -47,6 +52,7 @@ use soroban_sdk::{
 #[contract]
 pub struct LegacyV0Contract;
 
+#[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl LegacyV0Contract {
     /// Initialize without writing `ContractVersion` — defining trait of a legacy (v0) deployment.
@@ -55,11 +61,16 @@ impl LegacyV0Contract {
             return Err(QuickexError::AlreadyInitialized);
         }
         crate::storage::set_admin(&env, &admin);
-        crate::storage::set_paused(&env, false);
+        crate::storage::set_paused(&env, false, 0);
+        // Seed the Admin role so admin-gated calls (e.g. set_upgrade_window)
+        // work before migrate() is called. This matches production initialize().
+        let roles = soroban_sdk::vec![&env, crate::types::Role::Admin];
+        crate::storage::set_roles(&env, &admin, &roles);
         // ⚠️  Intentionally no set_contract_version — this is what makes it "legacy".
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn deposit(
         env: Env,
         token: Address,
@@ -68,10 +79,23 @@ impl LegacyV0Contract {
         salt: Bytes,
         timeout_secs: u64,
         arbiter: Option<Address>,
+        nonce_val: u64,
+        valid_until: u64,
     ) -> Result<BytesN<32>, QuickexError> {
-        crate::escrow::deposit(&env, token, amount, owner, salt, timeout_secs, arbiter)
+        crate::escrow::deposit(
+            &env,
+            token,
+            amount,
+            owner,
+            salt,
+            timeout_secs,
+            arbiter,
+            nonce_val,
+            valid_until,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn withdraw(
         env: Env,
         _token: Address,
@@ -79,16 +103,24 @@ impl LegacyV0Contract {
         _commitment: BytesN<32>,
         to: Address,
         salt: Bytes,
+        nonce_val: u64,
+        valid_until: u64,
     ) -> Result<bool, QuickexError> {
-        crate::escrow::withdraw(&env, amount, to, salt)
+        crate::escrow::withdraw(&env, amount, to, salt, nonce_val, valid_until)
     }
 
     pub fn dispute(env: Env, commitment: BytesN<32>) -> Result<(), QuickexError> {
         crate::escrow::dispute(&env, commitment)
     }
 
-    pub fn refund(env: Env, commitment: BytesN<32>, caller: Address) -> Result<(), QuickexError> {
-        crate::escrow::refund(&env, commitment, caller)
+    pub fn refund(
+        env: Env,
+        commitment: BytesN<32>,
+        caller: Address,
+        nonce_val: u64,
+        valid_until: u64,
+    ) -> Result<(), QuickexError> {
+        crate::escrow::refund(&env, commitment, caller, nonce_val, valid_until)
     }
 
     /// Store fee config directly — legacy simple-admin model (no role guard).
@@ -187,21 +219,48 @@ fn build_golden_state() -> (Env, GoldenState) {
             &salt_refunded,
             &100u64,
             &None,
+            &0u64,
+            &u64::MAX,
         );
         env.ledger().set_timestamp(200);
-        client.refund(&c_refunded, &alice);
+        client.refund(&c_refunded, &alice, &0u64, &u64::MAX);
 
         // ── Escrow 2: spent (withdrawn) ──────────────────────────────────
         tok.mint(&alice, &amount_spent);
         let salt_spent = Bytes::from_slice(&env, b"golden_spent");
-        let c_spent = client.deposit(&token, &amount_spent, &alice, &salt_spent, &0u64, &None);
-        client.withdraw(&token, &amount_spent, &c_spent, &alice, &salt_spent);
+        let c_spent = client.deposit(
+            &token,
+            &amount_spent,
+            &alice,
+            &salt_spent,
+            &0u64,
+            &None,
+            &1u64,
+            &u64::MAX,
+        );
+        client.withdraw(
+            &token,
+            &amount_spent,
+            &c_spent,
+            &alice,
+            &salt_spent,
+            &1u64,
+            &u64::MAX,
+        );
 
         // ── Escrow 3: pending (untouched until after upgrade) ─────────────
         tok.mint(&alice, &amount_pending);
         let salt_pending = Bytes::from_slice(&env, b"golden_pending");
-        let c_pending =
-            client.deposit(&token, &amount_pending, &alice, &salt_pending, &0u64, &None);
+        let c_pending = client.deposit(
+            &token,
+            &amount_pending,
+            &alice,
+            &salt_pending,
+            &0u64,
+            &None,
+            &2u64,
+            &u64::MAX,
+        );
 
         // ── Escrow 4: disputed ────────────────────────────────────────────
         tok.mint(&bob, &amount_disputed);
@@ -213,6 +272,8 @@ fn build_golden_state() -> (Env, GoldenState) {
             &salt_disputed,
             &0u64,
             &Some(arbiter.clone()),
+            &0u64,
+            &u64::MAX,
         );
         client.dispute(&c_disputed);
 
@@ -319,6 +380,8 @@ fn upgrade_harness_pending_escrow_is_withdrawable_post_upgrade() {
         &gs.commitment_pending,
         &gs.alice,
         &salt,
+        &0u64,
+        &u64::MAX,
     );
     assert!(withdrew, "withdrawal must succeed post-upgrade");
 
@@ -352,7 +415,14 @@ fn upgrade_harness_disputed_escrow_arbitration_works_post_upgrade() {
     client.migrate(&gs.admin);
 
     let recipient = Address::generate(&env);
-    client.resolve_dispute(&gs.arbiter, &gs.commitment_disputed, &false, &recipient);
+    client.resolve_dispute(
+        &gs.arbiter,
+        &gs.commitment_disputed,
+        &false,
+        &recipient,
+        &0u64,
+        &u64::MAX,
+    );
 
     assert_eq!(
         client.get_commitment_state(&gs.commitment_disputed),
@@ -406,6 +476,8 @@ fn upgrade_harness_already_spent_escrow_rejects_re_withdrawal() {
         &gs.commitment_spent,
         &gs.alice,
         &salt,
+        &0u64,
+        &u64::MAX,
     );
     assert!(
         result.is_err(),
@@ -556,16 +628,74 @@ fn upgrade_harness_legacy_symbol_privacy_key_readable_after_upgrade() {
     );
 }
 
+/// Issue #862 (SC-W8-01): an account whose privacy state was set only through
+/// the deprecated numeric-level `enable_privacy` API before the consolidation
+/// must be readable — and consistent — through both call styles after the
+/// upgrade, and must converge onto the canonical key once touched.
+#[test]
+fn upgrade_harness_deprecated_privacy_level_migrates_to_canonical_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(LegacyV0Contract, ());
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    {
+        let client = LegacyV0ContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+    }
+
+    // Seed only the deprecated numeric level key, simulating a pre-consolidation
+    // account that was never touched by the boolean `set_privacy` API.
+    env.as_contract(&contract_id, || {
+        let level_key = DataKey::PrivacyLevel(user.clone());
+        env.storage().persistent().set(&level_key, &1u32);
+    });
+
+    env.register_at(&contract_id, QuickexContract, ());
+    let client = QuickexContractClient::new(&env, &contract_id);
+    client.migrate(&admin);
+
+    // Both call styles agree, with no direct write yet.
+    assert!(
+        client.get_privacy(&user),
+        "legacy numeric level=1 must be readable as canonical `true` via get_privacy"
+    );
+    assert_eq!(
+        client.privacy_status(&user),
+        Some(1),
+        "privacy_status must agree with get_privacy for a legacy-only account"
+    );
+
+    // Touching the account through either API migrates it onto the canonical
+    // key and clears the deprecated numeric level permanently.
+    client.set_privacy(&user, &false);
+    assert!(!client.get_privacy(&user));
+    assert_eq!(client.privacy_status(&user), Some(0));
+
+    let level_still_present = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .has(&DataKey::PrivacyLevel(user.clone()))
+    });
+    assert!(
+        !level_still_present,
+        "deprecated PrivacyLevel key must be cleared once the account is migrated"
+    );
+}
+
 /// Regression: the escrow counter must not be touched by `migrate()`.
 ///
-/// `deposit()` does not use the escrow counter (only `create_escrow` does),
-/// so this test explicitly seeds the counter to a known non-zero value via
-/// storage and verifies it is unchanged after migration.
+/// No contract entrypoint writes the counter anymore — the `create_escrow`
+/// stub that once did was removed (SC-W8-02) — so this test seeds it
+/// directly via storage to a known non-zero value and verifies it is
+/// unchanged after migration.
 #[test]
 fn upgrade_harness_escrow_counter_survives_migration() {
     let (env, gs) = build_golden_state();
 
-    // Seed the counter to a known non-zero value (simulates prior create_escrow calls).
+    // Seed the counter to a known non-zero value directly via storage.
     env.as_contract(&gs.contract_id, || {
         for _ in 0..4 {
             crate::storage::increment_escrow_counter(&env);
@@ -632,4 +762,288 @@ fn upgrade_harness_all_lifecycle_statuses_are_distinct_post_migration() {
             expected
         );
     }
+}
+
+// ============================================================================
+// Upgrade Safety Gate Tests — Issue #432
+// ============================================================================
+
+/// Seed the Admin role by calling migrate (which detects legacy and seeds roles).
+/// Required because admin-gated functions (set_upgrade_window, start_upgrade,
+/// complete_upgrade) use require_admin which checks the role; the role is not
+/// automatically accessible after a WASM upgrade until migrate seeds it.
+fn seed_admin_role<'a>(
+    env: &'a Env,
+    contract_id: &Address,
+    admin: &Address,
+) -> QuickexContractClient<'a> {
+    let client = upgrade_to_current(env, contract_id);
+    client.migrate(admin);
+    client
+}
+
+#[test]
+fn upgrade_safety_gate_blocks_upgrade_outside_window() {
+    let (env, gs) = build_golden_state();
+    let client = seed_admin_role(&env, &gs.contract_id, &gs.admin);
+
+    // Window not set → upgrades blocked.
+    let result = client.try_start_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+    assert!(
+        result.is_err(),
+        "start_upgrade must fail when no window is set"
+    );
+
+    // Set a future window → still blocked.
+    let now = env.ledger().timestamp();
+    client.set_upgrade_window(&gs.admin, &(now + 1000), &(now + 2000));
+
+    let result = client.try_start_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+    assert!(
+        result.is_err(),
+        "start_upgrade must fail when current time is before window start"
+    );
+
+    // Advance time to within the window → succeeds.
+    env.ledger().with_mut(|li| {
+        li.timestamp = now + 1500;
+    });
+
+    client.start_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+
+    // complete_upgrade internally calls migrate and finalizes the upgrade.
+    client.complete_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+
+    // Advance time to after the window → now blocked.
+    env.ledger().with_mut(|li| {
+        li.timestamp = now + 2500;
+    });
+
+    let result = client.try_start_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+    assert!(
+        result.is_err(),
+        "start_upgrade must fail when current time is after window end"
+    );
+}
+
+#[test]
+fn upgrade_safety_gate_post_upgrade_invariants_enforced() {
+    let (env, gs) = build_golden_state();
+    let client = seed_admin_role(&env, &gs.contract_id, &gs.admin);
+
+    // Set a valid window: start=1 (before current timestamp 200), end=0 (no upper bound).
+    client.set_upgrade_window(&gs.admin, &1u64, &0u64);
+
+    // Attempt a normal upgrade: should validate invariants post-migrate.
+    client.start_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+
+    // complete_upgrade internally calls migrate and finalizes the upgrade.
+    let version = client.complete_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+    assert_eq!(version, CURRENT_CONTRACT_VERSION);
+
+    // Verify the contract is still in a valid state after complete_upgrade.
+    // This is implicit: if invariants failed, complete_upgrade would panic.
+
+    // Verify no upgrade is in progress anymore.
+    let (start, end) = client.get_upgrade_window();
+    // Window should be (1, 0) as set.
+    assert_eq!(start, 1);
+    assert_eq!(end, 0);
+}
+
+#[test]
+fn upgrade_safety_gate_invariant_failure_deterministic() {
+    let (env, gs) = build_golden_state();
+    let client = seed_admin_role(&env, &gs.contract_id, &gs.admin);
+
+    // Set valid window and start upgrade.
+    client.set_upgrade_window(&gs.admin, &1u64, &0u64);
+    client.start_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+
+    // Deliberately corrupt fee config to violate invariant (fee_bps > 10_000).
+    env.as_contract(&gs.contract_id, || {
+        crate::storage::set_fee_config(&env, &FeeConfig { fee_bps: 99999 });
+    });
+
+    // migrate must fail deterministically when invariants are violated (AC2).
+    let result = client.try_migrate(&gs.admin);
+    assert_eq!(
+        result,
+        Err(Ok(QuickexError::InternalError)),
+        "migrate must fail with InternalError when invariants are violated"
+    );
+
+    // Restore fee config and complete the upgrade cleanly.
+    env.as_contract(&gs.contract_id, || {
+        crate::storage::set_fee_config(&env, &FeeConfig { fee_bps: 200 });
+    });
+    // complete_upgrade internally calls migrate and finalizes the upgrade.
+    client.complete_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+}
+
+#[test]
+fn upgrade_safety_gate_emits_events() {
+    let (env, gs) = build_golden_state();
+    let client = seed_admin_role(&env, &gs.contract_id, &gs.admin);
+
+    // Set a valid window.
+    client.set_upgrade_window(&gs.admin, &1u64, &0u64);
+
+    // Capture event count before upgrade ceremony.
+    let events_before = env.events().all().len();
+
+    // Start upgrade → emits UpgradeStarted.
+    client.start_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+    let started_data = upgrade_ceremony_event_payload(&env, &gs.contract_id, "UpgradeStarted");
+
+    // Complete upgrade → internally calls migrate and emits UpgradeCompleted.
+    client.complete_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+    let completed_data = upgrade_ceremony_event_payload(&env, &gs.contract_id, "UpgradeCompleted");
+
+    // Verify at least UpgradeStarted + UpgradeCompleted were emitted (AC3).
+    let events_after = env.events().all().len();
+    assert!(
+        events_after > events_before || !started_data.is_empty(),
+        "upgrade ceremony must emit events (AC3: indexers can track upgrades from events alone)"
+    );
+
+    // Every emitted event must carry a schema version (event schema AC4).
+    for (name, data) in [
+        ("UpgradeStarted", started_data),
+        ("UpgradeCompleted", completed_data),
+    ] {
+        let version: u32 = data
+            .get(Symbol::new(&env, "schema_version"))
+            .unwrap_or_else(|| panic!("{name} payload must include schema_version"))
+            .try_into_val(&env)
+            .expect("schema_version must decode as u32");
+        assert_eq!(
+            version, EVENT_SCHEMA_VERSION,
+            "{name} must carry the current EVENT_SCHEMA_VERSION"
+        );
+        assert!(
+            data.get(Symbol::new(&env, "timestamp")).is_some(),
+            "{name} payload must include timestamp"
+        );
+    }
+}
+
+/// Returns the decoded data map of the most recent `event_name` event
+/// published by `contract_id`, panicking if it was never emitted.
+///
+/// Scans newest-first so callers can capture an event immediately after the
+/// invocation that emitted it, mirroring the `latest_contract_event` pattern
+/// used in `pause_policy_test.rs` / `fee_test.rs`.
+fn upgrade_ceremony_event_payload(
+    env: &Env,
+    contract_id: &Address,
+    event_name: &str,
+) -> soroban_sdk::Map<Symbol, soroban_sdk::Val> {
+    let all = env.events().all();
+    let mut seen: soroban_sdk::Vec<Symbol> = soroban_sdk::Vec::new(env);
+    for i in (0..all.len()).rev() {
+        let event = all.get(i).unwrap();
+        if event.0 != *contract_id {
+            continue;
+        }
+        let t1: Symbol = match event.1.get(1).and_then(|v| v.try_into_val(env).ok()) {
+            Some(sym) => sym,
+            None => continue,
+        };
+        let target = Symbol::new(env, event_name);
+        if t1 == target {
+            return event
+                .2
+                .try_into_val(env)
+                .expect("event data must decode into a symbol map");
+        }
+        seen.push_back(t1);
+    }
+    panic!(
+        "event {event_name} was not emitted by the contract (scanned {} events; topics seen: {seen:?})",
+        all.len()
+    );
+}
+
+#[test]
+fn upgrade_safety_gate_blocks_double_start() {
+    let (env, gs) = build_golden_state();
+    let client = seed_admin_role(&env, &gs.contract_id, &gs.admin);
+
+    client.set_upgrade_window(&gs.admin, &1u64, &0u64);
+
+    // First start succeeds.
+    client.start_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+
+    // Second start (without complete_upgrade) fails → upgrade already in progress.
+    let result = client.try_start_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+    assert!(
+        result.is_err(),
+        "start_upgrade must fail when upgrade already in progress"
+    );
+
+    // Clean up by completing the upgrade (internally calls migrate).
+    client.complete_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+
+    // Now a new start is allowed.
+    client.start_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+}
+
+#[test]
+fn upgrade_safety_gate_non_admin_blocked() {
+    let (env, gs) = build_golden_state();
+    let client = seed_admin_role(&env, &gs.contract_id, &gs.admin);
+    let non_admin = Address::generate(&env);
+
+    client.set_upgrade_window(&gs.admin, &1u64, &0u64);
+
+    // Non-admin attempts start_upgrade → fails.
+    let result = client.try_start_upgrade(&non_admin, &CURRENT_CONTRACT_VERSION);
+    assert!(result.is_err(), "start_upgrade by non-admin must fail");
+
+    // Non-admin attempts set_upgrade_window → fails.
+    let result = client.try_set_upgrade_window(&non_admin, &1u64, &0u64);
+    assert!(result.is_err(), "set_upgrade_window by non-admin must fail");
+}
+
+/// SC-W8-10 (Issue #871): a migration that fails must leave the stored
+/// version exactly where it started, not partially advanced.
+///
+/// This exercises Soroban's atomic-invocation rollback through the real
+/// `migrate()` entrypoint: the version-1 step itself runs successfully and
+/// writes `ContractVersion`, but the post-upgrade invariant check (fee_bps
+/// deliberately corrupted here) then fails, so the whole invocation —
+/// including that already-written version bump — is discarded.
+#[test]
+fn upgrade_harness_failed_migration_leaves_version_at_prior_value() {
+    let (env, gs) = build_golden_state();
+    // Swap in the current WASM but do NOT migrate yet — unlike
+    // `seed_admin_role`, which already calls `migrate()` once. This test
+    // needs the very first migrate attempt (legacy -> v1) to be the one
+    // that fails, so `before` is genuinely `LEGACY_CONTRACT_VERSION`.
+    let client = upgrade_to_current(&env, &gs.contract_id);
+
+    env.as_contract(&gs.contract_id, || {
+        crate::storage::set_fee_config(&env, &FeeConfig { fee_bps: 99999 });
+    });
+
+    let before = client.get_version();
+    assert_eq!(before, LEGACY_CONTRACT_VERSION);
+
+    let result = client.try_migrate(&gs.admin);
+    assert_eq!(result, Err(Ok(QuickexError::InternalError)));
+
+    let after = client.get_version();
+    assert_eq!(
+        after, before,
+        "a failed migrate() must not leave the version partially advanced"
+    );
+
+    // The contract is still usable and can complete the migration once the
+    // underlying problem is fixed — the failure was not fatal to the contract.
+    env.as_contract(&gs.contract_id, || {
+        crate::storage::set_fee_config(&env, &FeeConfig { fee_bps: 200 });
+    });
+    let version = client.migrate(&gs.admin);
+    assert_eq!(version, CURRENT_CONTRACT_VERSION);
 }

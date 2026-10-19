@@ -8,26 +8,33 @@
 import { Module, forwardRef } from "@nestjs/common";
 import { JobQueueService } from "./job-queue.service";
 import { JobRepository } from "./job.repository";
+import { JobReplayRepository } from "./job-replay.repository";
 import { JobRegistry } from "./job-registry.service";
 import { JobExecutor } from "./job-executor.service";
 import { CancellationStore } from "./cancellation-token";
 import { JobQueueInitializer } from "./job-queue-initializer.service";
 import { JobAdminController } from "./job-admin.controller";
 import { JobQueueMetricsService } from "./job-queue-metrics.service";
+import { DeadLetterQueueMonitorService } from "./dead-letter-monitor.service";
 import { SupabaseModule } from "../supabase/supabase.module";
 import { NotificationsModule } from "../notifications/notifications.module";
+import { NotificationPreferencesRepository } from "../notifications/notification-preferences.repository";
 import { LinksModule } from "../links/links.module";
 import { ReconciliationModule } from "../reconciliation/reconciliation.module";
 import { IngestionModule } from "../ingestion/ingestion.module";
 import { AuthModule } from "../auth/auth.module";
 import { MetricsModule } from "../metrics/metrics.module";
 import { ApiKeysModule } from "../api-keys/api-keys.module";
+import { FiatRampsModule } from "../fiat-ramps/fiat-ramps.module";
+import { ExportStorageModule } from "../exports/export-storage.module";
+import { SentryModule } from "../sentry";
 import {
   WebhookDeliveryHandler,
   RecurringPaymentHandler,
   ExportGenerationHandler,
   ReconciliationHandler,
   StellarReconnectHandler,
+  Sep24StatusPollHandler,
 } from "./handlers";
 
 /**
@@ -54,36 +61,45 @@ import {
     AuthModule,
     MetricsModule,
     ApiKeysModule,
+    ExportStorageModule,
+    SentryModule,
     forwardRef(() => NotificationsModule),
     forwardRef(() => LinksModule),
     forwardRef(() => ReconciliationModule),
     forwardRef(() => IngestionModule),
+    forwardRef(() => FiatRampsModule),
   ],
   controllers: [JobAdminController],
   providers: [
     JobQueueService,
     JobRepository,
+    JobReplayRepository,
     JobRegistry,
     JobExecutor,
     CancellationStore,
     JobQueueInitializer,
     JobQueueMetricsService,
+    DeadLetterQueueMonitorService,
     WebhookDeliveryHandler,
     RecurringPaymentHandler,
     ExportGenerationHandler,
     ReconciliationHandler,
     StellarReconnectHandler,
+    Sep24StatusPollHandler,
+    NotificationPreferencesRepository,
   ],
   exports: [
     JobQueueService,
     JobRegistry,
     JobRepository,
+    JobReplayRepository,
     JobQueueMetricsService,
     WebhookDeliveryHandler,
     RecurringPaymentHandler,
     ExportGenerationHandler,
     ReconciliationHandler,
     StellarReconnectHandler,
+    Sep24StatusPollHandler,
   ],
 })
 export class JobQueueModule {}
