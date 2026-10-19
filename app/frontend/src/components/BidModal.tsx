@@ -81,11 +81,11 @@ export function BidModal({ listing, onClose, onBidSuccess }: BidModalProps) {
                 <span className="text-foreground font-bold">@{listing.username}</span>.
               </p>
               <div className="p-4 bg-indigo-500/10 rounded-2xl border border-indigo-500/20 text-left text-xs text-subtle font-mono">
-                <p className="font-bold text-indigo-400 mb-1">tx signed & broadcast ✓</p>
+                <p className="font-bold text-indigo-400 mb-1">bid recorded ✓</p>
                 <p>Network: Stellar Testnet</p>
                 <p>Asset: USDC</p>
                 <p>Amount: {parsedAmount}.00 USDC</p>
-                <p>Ledger: ~2s settlement</p>
+                <p>Status: off-chain bid registered</p>
               </div>
               <button
                 onClick={handleClose}
@@ -208,7 +208,7 @@ export function BidModal({ listing, onClose, onBidSuccess }: BidModalProps) {
                 <span className="text-amber-400 mt-0.5">🔑</span>
                 <div className="text-[11px] text-amber-400/80 leading-relaxed">
                   <p className="font-bold mb-1">Wallet Connection Required</p>
-                  <p>Confirming will request a signature from your Stellar wallet (Freighter/Lobstr). No funds will be deducted until auction ends.</p>
+                  <p>Confirming will submit your bid as an off-chain record. No wallet signature or fund deduction occurs until the auction ends.</p>
                 </div>
               </div>
 
@@ -273,10 +273,10 @@ export function BidModal({ listing, onClose, onBidSuccess }: BidModalProps) {
                     {bidState === "loading" ? (
                       <>
                         <span className="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                        Signing...
+                        Placing Bid...
                       </>
                     ) : (
-                      "Sign & Pay"
+                      "Place Bid"
                     )}
                   </button>
                 </div>
