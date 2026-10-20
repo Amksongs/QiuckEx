@@ -93,7 +93,7 @@ behavior):
 ```http
 Deprecation: @1792454400
 Sunset: Mon, 18 Jan 2027 00:00:00 GMT
-Link: <https://github.com/Pulsefy/QiuckEx/blob/main/docs/REST-API-VERSIONING-AND-DEPRECATION.md#api-changelog>; rel="deprecation"
+Link: <https://github.com/Pulsefy/QiuckEx/blob/main/docs/REST-API-VERSIONING-AND-DEPRECATION.md#7-api-changelog>; rel="deprecation"
 ```
 
 - `Deprecation` — structured-field date (RFC 9745): `@<unix-seconds>` of the announce date.
@@ -117,7 +117,7 @@ Then regenerate and commit the spec in the same PR: `pnpm api-client:generate` (
 `app/backend/docs/openapi.yaml` is stale). Generated clients surface the operation as deprecated,
 which is compile-time visibility for `@quickex/api-client` users.
 
-**3. Changelog** — an entry in [#api-changelog](#api-changelog) (§7) with: route, announce date,
+**3. Changelog** — an entry in [#7-api-changelog](#7-api-changelog) with: route, announce date,
 sunset date, replacement route, migration notes. The
 [BACKEND-CLIENT-CONTRACT-MAP.md](./BACKEND-CLIENT-CONTRACT-MAP.md) alias/endpoint tables are
 updated in the same PR — the map is what contributors read first.
@@ -226,7 +226,7 @@ Every breaking change uses all five channels, in this order of authority:
 - **Emergency removals** compress the window: GitHub security advisory + a §7 entry marked
   `emergency`, no 90-day wait.
 
-## API changelog
+## 7. API changelog
 
 Append-only, newest first. Every deprecation, removal, extension, and alias introduction gets one
 entry in the PR that makes the change.
